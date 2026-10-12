@@ -4,3 +4,4 @@ py/.venv
 py/__pycache__
 data
 .env
+wads/*.wad
