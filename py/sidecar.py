@@ -121,6 +121,7 @@ class Doom:
         self.seen_monsters = set()  # object ids ever seen in view this episode
         self.frames_dir = os.environ.get("DOOM_FRAMES_DIR", "")
         self.action_log = []
+        self.notes = []       # HUD messages seen during the current act
 
     # ── lifecycle ──
     def start(self, game="freedoom1", map=None, skill=3, width=320, height=240):
@@ -157,10 +158,11 @@ class Doom:
             g.set_sectors_info_enabled(True)
             g.set_labels_buffer_enabled(True)
             g.set_automap_buffer_enabled(True)
-            g.set_automap_mode(vzd.AutomapMode.OBJECTS_WITH_SIZE)
+            g.set_automap_mode(vzd.AutomapMode.NORMAL)  # what the player has explored, no object cheat
             g.set_automap_rotate(False)
             g.set_automap_render_textures(False)
             g.set_notifications_buffer_enabled(True)
+            g.set_notifications_buffer_size(16)
             g.init()
             self.g, self.game, self.skill, self.res = g, game, skill, res
         else:
@@ -279,21 +281,20 @@ class Doom:
         # wall clearance by ray cast
         out["clearance"] = self.clearance(s, px, py, pz, pa)
         # notifications (pickup messages etc.)
-        notes = []
-        try:
-            nb = s.notifications_buffer
-            if nb:
-                notes = [n for n in str(nb).replace("\r", "").split("\n") if n.strip()]
-        except Exception:
-            pass
-        if notes:
-            out["messages"] = notes
+        self._collect_notes(s)
+        if self.notes:
+            out["messages"] = list(dict.fromkeys(self.notes))
+            self.notes = []
+        # The automap follows the player; crop the middle half and double it so it is readable at 320×240.
+        am = s.automap_buffer
+        ah, aw = am.shape[0], am.shape[1]
+        am = am[ah // 4: 3 * ah // 4, aw // 4: 3 * aw // 4]
         if image in ("frame", "both"):
             out["frame_jpeg"] = jpeg_b64(s.screen_buffer, scale=image_scale)
         if image in ("automap", "both"):
-            out["automap_jpeg"] = jpeg_b64(s.automap_buffer, scale=image_scale)
+            out["automap_jpeg"] = jpeg_b64(am, scale=2.0 * image_scale)
         # Always a full-size pair for the people watching, whatever the player asked for.
-        out["view"] = {"frame": jpeg_b64(s.screen_buffer), "automap": jpeg_b64(s.automap_buffer)}
+        out["view"] = {"frame": jpeg_b64(s.screen_buffer), "automap": jpeg_b64(am, scale=2.0)}
         if self.frames_dir:
             try:
                 Image.fromarray(s.screen_buffer).save(os.path.join(self.frames_dir, "latest.jpg"), quality=80)
@@ -301,6 +302,20 @@ class Doom:
             except Exception as e:
                 log("frame save failed:", e)
         return out
+
+    def _collect_notes(self, s):
+        try:
+            nb = s.notifications_buffer if s is not None else ""
+            for n in str(nb or "").replace("\r", "").split("\n"):
+                n = n.strip()
+                if not n or n.startswith("No bots file"):
+                    continue
+                if n.startswith("+"):
+                    n = "Map: " + n[1:].strip()
+                if not self.notes or self.notes[-1] != n:
+                    self.notes.append(n)
+        except Exception:
+            pass
 
     def clearance(self, s, px, py, pz, pa):
         """Distance to the nearest wall/closed door at several bearings (degrees, + = right)."""
@@ -325,8 +340,11 @@ class Doom:
                 if t is None or t >= best:
                     continue
                 two_sided = len(e["sectors"]) >= 2
-                if e["blocking"] or not two_sided:
+                if not two_sided:
                     best, kind = t, "wall"
+                    continue
+                if e["blocking"]:
+                    best, kind = t, "fence"   # see-through barrier (window, railing, grate)
                     continue
                 # two-sided: passable if some bordering sector is open relative to our floor
                 passable, door = False, False
@@ -353,17 +371,22 @@ class Doom:
         events = []
         done_reason = None
         before = self._snapshot()
+        self.notes = []
+        descs = []
         for i, action in enumerate(actions):
             if self.finished():
                 break
             desc, reason = self._run_action(action, stop_on, events)
             self.action_log.append(desc)
+            descs.append(desc)
             if reason:
                 done_reason = reason
                 events.append(f"Stopped after action {i + 1} ({desc}): {reason}." + (f" {len(actions) - i - 1} queued action(s) dropped." if i + 1 < len(actions) else ""))
                 break
         after = self._snapshot()
         events[0:0] = self._diff_events(before, after)
+        if descs:
+            events.insert(0, "Did: " + " · ".join(descs) + ".")
         if self.dead():
             events.append("YOU DIED. Call game_start to try the level again.")
         elif self.finished():
@@ -422,14 +445,15 @@ class Doom:
         if g.is_player_dead():
             return "you died"
         if g.is_episode_finished():
-            return "level complete" if "level" in stop_on or True else None
+            return "level complete"
         h = float(g.get_game_variable(vzd.GameVariable.HEALTH))
         if "damage" in stop_on and h < watch["health"]:
             watch["health"] = h
             return f"took damage (health now {int(h)})"
         watch["health"] = h
+        s = g.get_state()
+        self._collect_notes(s)
         if "enemy" in stop_on:
-            s = g.get_state()
             if s is not None:
                 for l in s.labels:
                     if l.object_category == "Monster" and l.object_id not in self.seen_monsters and l.width > 0:
@@ -485,6 +509,7 @@ class Doom:
             vec = self._press(**{btn: 1, "SPEED": 1 if run else 0})
             x0, y0 = self._pos()
             reason = self._step_stuck(vec, tics, stop_on, watch)
+            self._brake()
             x1, y1 = self._pos()
             return f"move {direction} {tics} tics (went {int(math.hypot(x1 - x0, y1 - y0))} units)", reason
         if "turn" in action:
@@ -520,6 +545,7 @@ class Doom:
             while used < max_tics:
                 b, d = self._bearing_to(tx, ty)
                 if d <= stop_dist:
+                    self._brake()
                     return f"goto {what}: arrived ({int(d)} units away)", None
                 if abs(b) > 3:
                     r = self._turn(b, stop_on, watch)
@@ -535,6 +561,8 @@ class Doom:
                 if math.hypot(ax - bx, ay - by) < 3:
                     b2, d2 = self._bearing_to(tx, ty)
                     return f"goto {what}", f"blocked {int(d2)} units short of the target (wall, door, ledge or obstacle in the way)"
+                if r is None and used >= max_tics:
+                    self._brake()
             b, d = self._bearing_to(tx, ty)
             x1, y1 = self._pos()
             return f"goto {what}: out of time, {int(d)} units left (went {int(math.hypot(x1 - x0, y1 - y0))})", None
@@ -564,8 +592,13 @@ class Doom:
             self.g.make_action(self._press(), 4)
             hits = int(float(self.g.get_game_variable(vzd.GameVariable.HITCOUNT)) - hits0)
             used = int(ammo0 - float(self.g.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)))
-            r = None if hits else self._check(stop_on - {"damage"} if False else stop_on, watch)
-            return f"attack ×{shots}: {used} ammo used, {hits} hit(s)", r if r and "sighted" not in r else None
+            desc = f"attack ×{shots}: {used} ammo used, {hits} hit(s)"
+            if self.g.is_player_dead():
+                return desc, "you died"
+            close = self._close_monster()
+            if close and "enemy" in stop_on:
+                return desc, f"{close[0]} #{close[2]} still up at {close[1]} units"
+            return desc, None
         if "use" in action:
             self.g.make_action(self._press(USE=1), 2)
             r = self._step(self._press(), int(action.get("tics", 25)), stop_on, watch)
@@ -588,6 +621,24 @@ class Doom:
 
     def _pos(self):
         return float(self.g.get_game_variable(vzd.GameVariable.POSITION_X)), float(self.g.get_game_variable(vzd.GameVariable.POSITION_Y))
+
+    def _brake(self):
+        """Doom keeps sliding after you let go; six idle tics settle the player before the next action."""
+        if not self.g.is_episode_finished():
+            self.g.make_action(self._press(), 6)
+
+    def _close_monster(self, limit=320):
+        s = self.g.get_state()
+        if s is None:
+            return None
+        px, py = self._pos()
+        best = None
+        for l in s.labels:
+            if l.object_category == "Monster" and l.width > 0:
+                d = math.hypot(l.object_position_x - px, l.object_position_y - py)
+                if d <= limit and (best is None or d < best[1]):
+                    best = (MONSTER_NAMES.get(l.object_name, l.object_name), int(d), l.object_id)
+        return best
 
     def _step_stuck(self, vec, tics, stop_on, watch):
         """Like _step but also stops when the player stops making progress (wall/obstacle)."""
