@@ -11,6 +11,7 @@ Browser (viewer) ──/ws + /api──────┘
 - **The world only moves while the player acts.** `game_act` runs a short list of actions (move, turn, face, goto, attack, use, weapon, wait), stops early when something happens (damage, a new enemy in view, death, level end, blocked), and returns the result: status, events, what is in view with bearings and distances, "heard" monsters out of view, clearance to the nearest wall/door/ledge at seven bearings, and the rendered frame (optionally the automap). An agent that takes a minute between turns plays at exactly its own pace.
 - **Watchers** see every turn as it happens (frame, automap, HUD, the actions, the events, the player's commentary) and can chat. Chat reaches the player under "Watchers say" with their next turn, or as a `games:chat` push event when they are idle.
 - **Games:** Freedoom Phase 1 (E1M1–E4M9) and Phase 2 (MAP01–MAP32) ship with the engine. Drop `doom.wad` / `doom2.wad` / `heretic.wad` into `DOOM_WAD_DIR` (`wads/` here, gitignored; in production synced at startup from a private S3 bucket into the volume — `WADS_S3_ENDPOINT/BUCKET/PREFIX/KEY/SECRET`, rclone) and `doom` (Ultimate Doom, 4 episodes), `doom2` (32 maps) and `heretic` (5 episodes; wand/crossbow/dragon claw, gargoyles/golems) appear too.
+- **Restarts:** a game in progress survives a server restart or redeploy. After every turn the engine writes a ZDoom savegame (`autosave.zds`) next to the recording plus `state.json` (player, map, turn, explored areas); at startup the server resumes each game that was running — same id, same watch URL, history and chat replayed — and the player's next `game_act` just continues (it sees "Resumed after a server restart"). Browser sessions are persisted too (`sessions.json`), so watchers stay signed in. `test/resume.ts` exercises the whole cycle.
 - **Recordings:** every game is written to `<data>/recordings/<id>/` as it is played (turn log + a frame and automap per turn, ~35 KB/turn). The lobby lists them; `/r/<id>` replays with a scrubber, play/pause, speed, HUD, turn log and chat as it happened. `GAMES_KEEP_RECORDINGS` (200) bounds the disk.
 
 ## Tools (feature set `games`)
@@ -45,6 +46,7 @@ npm install && npm run build
 GAMES_DEV_ISSUER=dev.local GAMES_ISSUERS= node dist/src/index.js     # http://localhost:7372, sign in as anyone
 node --import tsx test/e2e.ts http://localhost:7372                   # plays over /mcpl, checks the viewer
 node --import tsx test/demo.ts http://localhost:7372 100 3            # a scripted player to watch
+DOOM_WAD_DIR=$PWD/wads node --import tsx test/resume.ts               # restart survival (starts its own server on :7399)
 ```
 
 | env | default | |
