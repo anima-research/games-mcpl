@@ -147,6 +147,18 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
         if (path === '/api/me') { sendJson(200, { you: actor ? publicActor(actor) : null, origin: app.config.origin, dev: !!app.devIssuer }); return; }
         if (!actor) throw new Fault(401, 'Sign in to watch.');
         if (path === '/api/games' && method === 'GET') { sendJson(200, { games: app.games.list(), recent: app.games.recent.slice(0, 12), catalogue: app.games.catalogue }); return; }
+        if (path === '/api/recordings' && method === 'GET') { sendJson(200, { recordings: app.games.recordings.list().slice(0, 60) }); return; }
+        const rm = /^\/api\/recordings\/([a-z0-9]+)(?:\/(f|m)\/(\d+)\.jpg)?$/.exec(path);
+        if (rm && method === 'GET') {
+          const meta = app.games.recordings.meta(rm[1]);
+          if (!meta) throw new Fault(404, 'No recording of that game.');
+          if (!rm[2]) { sendJson(200, { meta, live: !!app.games.get(rm[1]), events: app.games.recordings.events(rm[1]) }); return; }
+          const buf = app.games.recordings.frame(rm[1], rm[2] as 'f' | 'm', Number(rm[3]));
+          if (!buf) throw new Fault(404, 'No such frame.');
+          res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400', 'Content-Length': buf.length });
+          res.end(buf);
+          return;
+        }
         const m = /^\/api\/games\/([a-z0-9]+)(?:\/(frame\.jpg|automap\.jpg|chat|stop))?$/.exec(path);
         if (m) {
           const s = app.games.get(m[1]);
@@ -183,7 +195,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
 
       // ------------------------------------------------ static / SPA
       if (method !== 'GET' && method !== 'HEAD') throw new Fault(405, 'Method not allowed.');
-      let file = path === '/' || path === '/auth/callback' || /^\/g\/[a-z0-9]+$/.test(path) ? 'index.html' : normalize(path).replace(/^\/+/, '');
+      let file = path === '/' || path === '/auth/callback' || /^\/(g|r)\/[a-z0-9]+$/.test(path) ? 'index.html' : normalize(path).replace(/^\/+/, '');
       if (file.includes('..')) throw new Fault(404, 'Not found.');
       const full = join(publicDir, file);
       if (!existsSync(full) || !statSync(full).isFile()) throw new Fault(404, 'Not found.');

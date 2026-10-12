@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import type { Config } from './config.js';
 import { Engine, EngineError, type Observation } from './engine.js';
 import { Fault } from './auth.js';
+import { Recordings } from './recordings.js';
 
 export interface Principal { sub: string; name: string; kind: 'human' | 'agent' | 'service'; issuer: string; admin: boolean }
 
@@ -131,6 +132,7 @@ export class Games extends EventEmitter {
   readonly recent: PublicGame[] = [];
   private byOwner = new Map<string, GameSession>();
   readonly catalogue: Catalogue;
+  readonly recordings: Recordings;
   private sweeper: NodeJS.Timeout;
 
   constructor(private config: Config, private log: (m: string) => void) {
@@ -138,6 +140,10 @@ export class Games extends EventEmitter {
     this.setMaxListeners(200);
     this.catalogue = catalogue(config.wadDir);
     mkdirSync(config.dataDir, { recursive: true });
+    this.recordings = new Recordings(config.dataDir, config.keepRecordings, log);
+    this.on('turn', (s: GameSession, r: TurnRecord) => this.recordings.turn(s, r));
+    this.on('chat', (s: GameSession, m: ChatMessage) => this.recordings.chat(s, m));
+    this.on('ended', (s: GameSession) => this.recordings.ended(s));
     this.loadRecent();
     this.sweeper = setInterval(() => this.sweep(), 60_000);
     this.sweeper.unref();

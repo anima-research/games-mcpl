@@ -71,7 +71,7 @@
   let lobbyWs = null;
   function lobbyPage() {
     const live = h('div.cards'), recent = h('div.list');
-    main.replaceChildren(h('h1', null, 'Playing now'), h('p.muted.small', null, 'Each game moves only when its player acts — a turn every few seconds to a minute. Click one to watch.'), live, h('h2', null, 'Recent games'), recent);
+    main.replaceChildren(h('h1', null, 'Playing now'), h('p.muted.small', null, 'Each game moves only when its player acts — a turn every few seconds to a minute. Click one to watch.'), live, h('h2', null, 'Recordings'), h('p.muted.small', null, 'Every game is recorded turn by turn; open one to replay it.'), recent);
     const render = ({ games, recent: rec }) => {
       live.replaceChildren(...(games.length ? games.map((g) => h('a.card', { href: `/g/${g.id}` },
         h('div.who', null, h('span', null, g.player.name), statusBadge(g)),
@@ -79,9 +79,12 @@
         h('div.bar' + ((g.health ?? 100) < 35 ? '.low' : ''), null, h('i', { style: `width:${Math.max(0, Math.min(100, g.health ?? 0))}%` })),
         h('div.small.muted', null, `health ${g.health ?? '–'} · armor ${g.armor ?? '–'} · ${g.weapon ?? ''} · kills ${g.kills ?? 0} · items ${g.items ?? 0} · ${mmss(g.time_s)}`),
         g.lastSay ? h('div.say', null, `“${g.lastSay}”`) : null)) : [h('div.muted', null, 'Nobody is playing right now.')]));
-      recent.replaceChildren(...(rec.length ? rec.map((g) => h('div.row', null, h('span', null, h('b', null, g.player.name), ` — ${g.game} ${g.map}`), h('span.muted', null, `${g.status} · ${g.kills ?? 0} kills · ${g.turn} turns · ${mmss(g.time_s)} · ${ago(g.endedAt || g.lastActiveAt)} ago`))) : [h('div.muted.small', null, 'None yet.')]));
+    };
+    const renderRecordings = ({ recordings }) => {
+      recent.replaceChildren(...(recordings.length ? recordings.map((g) => h('a.row', { href: `/r/${g.id}` }, h('span', null, h('b', null, g.player.name), ` — ${g.game} ${g.map}`), h('span.muted', null, `${g.status} · ${g.kills ?? 0} kills · ${g.turn} turns · ${mmss(g.time_s)} · ${ago(g.endedAt || g.lastActiveAt)} ago`))) : [h('div.muted.small', null, 'None yet.')]));
     };
     api('GET', '/api/games').then(render).catch((e) => main.append(h('p.err', null, e.message)));
+    api('GET', '/api/recordings').then(renderRecordings).catch(() => {});
     lobbyWs = openWs('/ws', (m) => { if (m.type === 'list') render(m); });
   }
 
@@ -143,8 +146,73 @@
       if (m.type === 'hello') { setGame(m.game); setHud(m.last); setFrames(m.frame, m.automap); log.replaceChildren(); (m.log || []).forEach(addTurn); chat.replaceChildren(); (m.chat || []).forEach(addChat); }
       else if (m.type === 'turn') { setGame(m.game); setHud(m.last); setFrames(m.frame, m.automap); addTurn(m.record); }
       else if (m.type === 'chat') addChat(m.message);
-      else if (m.type === 'ended') { if (m.game) setGame(m.game); else { title.textContent = 'This game is over.'; } overlay.textContent = 'game over'; }
+      else if (m.type === 'ended') { if (m.game) setGame(m.game); else { title.textContent = 'This game is over.'; } overlay.textContent = 'game over'; sub.append(' · ', h('a', { href: `/r/${id}` }, 'watch the replay')); }
     }, () => { if (game && game.status !== 'running') return false; return true; });
+  }
+
+  // ------------------------------------------------------------ replay page
+  function replayPage(id) {
+    const img = h('img', { alt: 'game view' }), overlay = h('div.overlay', null, '…');
+    const hud = h('div.hud'), automap = h('img.automap', { alt: 'automap', style: 'display:none' });
+    const log = h('div.log'), chat = h('div.chat');
+    const title = h('h1', null, 'Replay'), sub = h('div.muted.small', null, '');
+    const slider = h('input', { type: 'range', min: '0', max: '0', value: '0', style: 'flex:1' });
+    const playBtn = h('button.primary', null, '▶ Play'), prevBtn = h('button', null, '‹'), nextBtn = h('button', null, '›');
+    const counter = h('span.muted.small', null, '');
+    const speed = h('select', null, ...[['0.5', '2 s/turn'], ['1', '1 s/turn'], ['2', '½ s/turn']].map(([v, l]) => h('option', { value: v }, l)));
+    main.replaceChildren(
+      h('div', { style: 'display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap' }, h('div', null, title, sub), h('a', { href: '/' }, '← all games')),
+      h('div.game', null,
+        h('div', null, h('div.screen', null, img, overlay),
+          h('div.controls', null, prevBtn, playBtn, nextBtn, slider, counter, speed), hud, h('div.maps', null, automap)),
+        h('div.side', null, h('div.panel', null, h('h3', null, 'Turns'), log), h('div.panel', null, h('h3', null, 'Chat'), chat))));
+    let turns = [], chats = [], cur = -1, timer = null;
+    const evBits = (e) => h('div.ev.' + evClass(e), null, e);
+    const turnEl = (r) => h('div.turn', null,
+      r.actions && r.actions.length ? h('div', null, h('span.n', null, `#${r.n}`), h('span.acts', null, r.actions.map(fmtAction).join(' · '))) : null,
+      ...(r.events || []).map(evBits), r.say ? h('div.bubble', null, r.say) : null);
+    const show = (i) => {
+      if (!turns.length) return;
+      cur = Math.max(0, Math.min(turns.length - 1, i));
+      const t = turns[cur];
+      const f = t.frameIndex;
+      if (f != null) { img.src = `/api/recordings/${id}/f/${f}.jpg`; automap.src = `/api/recordings/${id}/m/${f}.jpg`; automap.style.display = ''; }
+      slider.value = String(cur); counter.textContent = `${cur + 1} / ${turns.length}`;
+      overlay.textContent = `turn ${t.record.n}` + (t.record.at ? ` · ${new Date(t.record.at).toLocaleTimeString()}` : '');
+      const s = t.record.status || {};
+      const ammo = s.ammo ? Object.entries(s.ammo).filter(([, v]) => v > 0).map(([k, v]) => `${k} ${v}`).join(' · ') : '';
+      hud.replaceChildren(
+        h('span', null, h('span.k', null, 'health'), h('b', { style: `color:${(s.health ?? 100) < 35 ? 'var(--accent)' : 'var(--ok)'}` }, s.health ?? '–')),
+        h('span', null, h('span.k', null, 'armor'), h('b', null, s.armor ?? '–')),
+        h('span', null, h('span.k', null, 'weapon'), h('b', null, s.weapon ?? '–'), s.weapon_ammo != null ? ` (${s.weapon_ammo})` : ''),
+        ammo ? h('span', null, h('span.k', null, 'ammo'), ammo) : null,
+        h('span', null, h('span.k', null, 'kills'), h('b', null, s.kills ?? 0)), h('span', null, h('span.k', null, 'items'), h('b', null, s.items ?? 0)),
+        h('span', null, h('span.k', null, 'secrets'), h('b', null, s.secrets ?? 0)), h('span', null, h('span.k', null, 'time'), mmss(s.time_s)),
+        t.record.position ? h('span.muted.small', null, `(${t.record.position.x}, ${t.record.position.y}) facing ${t.record.position.angle}°`) : null);
+      log.replaceChildren(...turns.slice(Math.max(0, cur - 40), cur + 1).map((x) => turnEl(x.record)));
+      log.scrollTop = log.scrollHeight;
+      const until = t.record.at || Infinity;
+      chat.replaceChildren(...chats.filter((m) => m.at <= until).slice(-60).map((m) => h('div.msg' + (m.from.kind === 'agent' ? '.agent' : ''), null, h('b', null, m.from.name), ': ', m.text)));
+      chat.scrollTop = chat.scrollHeight;
+    };
+    const stop = () => { if (timer) clearInterval(timer); timer = null; playBtn.textContent = '▶ Play'; };
+    const play = () => { if (cur >= turns.length - 1) show(0); timer = setInterval(() => { if (cur >= turns.length - 1) stop(); else show(cur + 1); }, 1000 / Number(speed.value)); playBtn.textContent = '❚❚ Pause'; };
+    playBtn.onclick = () => (timer ? stop() : play());
+    prevBtn.onclick = () => { stop(); show(cur - 1); }; nextBtn.onclick = () => { stop(); show(cur + 1); };
+    slider.oninput = () => { stop(); show(Number(slider.value)); };
+    speed.onchange = () => { if (timer) { stop(); play(); } };
+    document.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft') prevBtn.onclick(); else if (e.key === 'ArrowRight') nextBtn.onclick(); else if (e.key === ' ') { e.preventDefault(); playBtn.onclick(); } });
+    api('GET', `/api/recordings/${id}`).then(({ meta, live, events }) => {
+      title.replaceChildren(`${meta.player.name} — ${meta.game} ${meta.map}`, ' ', statusBadge(meta), live ? h('a', { href: `/g/${id}`, style: 'margin-left:8px;font-size:14px' }, 'this game is live — watch it') : null);
+      sub.textContent = `skill ${meta.skill} · ${meta.turn} turns · ${meta.kills ?? 0} kills · ${mmss(meta.time_s)} · ${new Date(meta.createdAt).toLocaleString()}`;
+      let lastFrame = null;
+      for (const e of events) {
+        if (e.type === 'turn') { if (e.frame != null) lastFrame = e.frame; turns.push({ record: e.record, frameIndex: lastFrame }); }
+        else if (e.type === 'chat') chats.push(e.message);
+      }
+      slider.max = String(Math.max(0, turns.length - 1));
+      show(turns.length - 1);
+    }).catch((e) => { title.textContent = 'No recording'; sub.textContent = e.message; });
   }
 
   function openWs(path, onMessage, shouldReconnect = () => true) {
@@ -166,6 +234,8 @@
     if (!me) return signinPage();
     const g = /^\/g\/([a-z0-9]+)$/.exec(location.pathname);
     if (g) return gamePage(g[1]);
+    const r = /^\/r\/([a-z0-9]+)$/.exec(location.pathname);
+    if (r) return replayPage(r[1]);
     return lobbyPage();
   }
   route();

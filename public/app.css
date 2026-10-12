@@ -54,3 +54,7 @@ h1 { font-size: 22px; margin: 0 0 6px; } h2 { font-size: 15px; margin: 18px 0 8p
 .row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; font-size: 13.5px; }
 .signin { max-width: 420px; }
 .err { color: var(--accent); }
+.controls { display: flex; gap: 8px; align-items: center; padding: 10px 4px 0; }
+.controls input[type=range] { accent-color: var(--accent); }
+.controls select { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font: inherit; }
+a.row { color: var(--fg); } a.row:hover { border-color: #3a4150; }

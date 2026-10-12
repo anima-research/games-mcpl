@@ -45,15 +45,18 @@ GAMES = {
     "freedoom2": {"wad": os.path.join(VZD_DIR, "freedoom2.wad"), "maps": [f"MAP{m:02d}" for m in range(1, 33)],
                   "title": "Freedoom: Phase 2 (free Doom II-compatible campaign, 32 maps)"},
 }
-for name, maps, title in (("doom", [f"E{e}M{m}" for e in range(1, 5) for m in range(1, 10)], "DOOM (1993) — needs doom.wad in DOOM_WAD_DIR"),
-                          ("doom2", [f"MAP{m:02d}" for m in range(1, 33)], "DOOM II — needs doom2.wad in DOOM_WAD_DIR")):
+for name, maps, title in (("doom", [f"E{e}M{m}" for e in range(1, 5) for m in range(1, 10)], "The Ultimate DOOM (1993/95, 4 episodes × 9 maps)"),
+                          ("doom2", [f"MAP{m:02d}" for m in range(1, 33)], "DOOM II: Hell on Earth (32 maps)"),
+                          ("heretic", [f"E{e}M{m}" for e in range(1, 6) for m in range(1, 10)], "Heretic: Shadow of the Serpent Riders (5 episodes × 9 maps; wand, crossbow, dragon claw…)")):
     p = os.path.join(WAD_DIR, f"{name}.wad") if WAD_DIR else ""
     if p and os.path.exists(p):
-        GAMES[name] = {"wad": p, "maps": maps, "title": title.split(" — ")[0]}
+        GAMES[name] = {"wad": p, "maps": maps, "title": title}
 
 SKILLS = {1: "I'm too young to die", 2: "Hey, not too rough", 3: "Hurt me plenty", 4: "Ultra-Violence", 5: "Nightmare!"}
 
 WEAPON_NAMES = {1: "fist", 2: "pistol", 3: "shotgun", 4: "chaingun", 5: "rocket launcher", 6: "plasma rifle", 7: "BFG9000", 8: "chainsaw"}
+HERETIC_WEAPONS = {1: "staff", 2: "elven wand", 3: "ethereal crossbow", 4: "dragon claw", 5: "hellstaff", 6: "phoenix rod", 7: "firemace", 8: "gauntlets of the necromancer"}
+HERETIC_AMMO = {2: "wand crystals", 3: "ethereal arrows", 4: "claw orbs", 5: "hellstaff runes", 6: "flame orbs", 7: "mace spheres"}
 # Ammo slots as ViZDoom exposes them for (Free)Doom — measured with `give all` and weapon
 # switches: AMMO2 bullets (max 400), AMMO3 shells (100), AMMO5 rockets (100), AMMO6 cells
 # (600); AMMO4/AMMO7 mirror bullets/cells (parent ammo classes).
@@ -65,8 +68,12 @@ MONSTER_NAMES = {
     "HellKnight": "hell knight", "BaronOfHell": "baron of hell", "Arachnotron": "arachnotron", "PainElemental": "pain elemental",
     "Revenant": "revenant", "Fatso": "mancubus", "Archvile": "arch-vile", "SpiderMastermind": "spider mastermind", "Cyberdemon": "cyberdemon",
     "WolfensteinSS": "SS trooper",
+    # Heretic
+    "HereticImp": "gargoyle", "HereticImpLeader": "fire gargoyle", "Mummy": "golem", "MummyLeader": "nitrogolem", "MummyGhost": "golem ghost",
+    "MummyLeaderGhost": "nitrogolem ghost", "Knight": "undead warrior", "KnightGhost": "undead warrior ghost", "Wizard": "disciple of D'Sparil",
+    "Beast": "weredragon", "Snake": "ophidian", "Clink": "sabreclaw", "Ironlich": "iron lich", "Minotaur": "maulotaur", "Sorcerer1": "D'Sparil (on serpent)", "Sorcerer2": "D'Sparil",
 }
-INTERESTING = {"Monster", "Health", "Armor", "Ammo", "Weapon", "Key", "Powerup", "Hazard"}
+INTERESTING = {"Monster", "Health", "Armor", "Ammo", "Weapon", "Key", "Powerup", "Hazard", "Artifact"}
 
 FOV = 90.0
 TICS_PER_SEC = 35
@@ -234,12 +241,14 @@ class Doom:
         px, py, pz = v[GI[vzd.GameVariable.POSITION_X]], v[GI[vzd.GameVariable.POSITION_Y]], v[GI[vzd.GameVariable.POSITION_Z]]
         pa = v[GI[vzd.GameVariable.ANGLE]]
         sel = int(v[GI[vzd.GameVariable.SELECTED_WEAPON]])
-        weapons = [WEAPON_NAMES[i] for i in range(1, 9) if v[GI[getattr(vzd.GameVariable, f"WEAPON{i}")]] > 0]
+        wnames = HERETIC_WEAPONS if self.game == "heretic" else WEAPON_NAMES
+        anames = {} if self.game == "heretic" else AMMO_SLOTS   # Heretic ammo slots are unverified; the HUD shows them
+        weapons = [wnames[i] for i in range(1, 9) if v[GI[getattr(vzd.GameVariable, f"WEAPON{i}")]] > 0]
         out["status"] = {
             "health": int(v[GI[vzd.GameVariable.HEALTH]]), "armor": int(v[GI[vzd.GameVariable.ARMOR]]),
-            "weapon": WEAPON_NAMES.get(sel, f"slot {sel}"), "weapon_slot": sel,
+            "weapon": wnames.get(sel, f"slot {sel}"), "weapon_slot": sel,
             "weapon_ammo": int(v[GI[vzd.GameVariable.SELECTED_WEAPON_AMMO]]),
-            "ammo": {name: int(v[GI[getattr(vzd.GameVariable, f"AMMO{slot}")]]) for slot, name in AMMO_SLOTS.items()},
+            "ammo": {name: int(v[GI[getattr(vzd.GameVariable, f"AMMO{slot}")]]) for slot, name in anames.items()},
             "weapons": weapons,
             "kills": int(v[GI[vzd.GameVariable.KILLCOUNT]]), "items": int(v[GI[vzd.GameVariable.ITEMCOUNT]]),
             "secrets": int(v[GI[vzd.GameVariable.SECRETCOUNT]]),
@@ -250,7 +259,7 @@ class Doom:
         W, H = self.res
         visible, seen_ids = [], set()
         for l in s.labels:
-            if l.object_name == "DoomPlayer" or l.object_category not in INTERESTING:
+            if l.object_category == "Self" or l.object_category not in INTERESTING:
                 continue
             if l.width == 0 or l.height == 0:
                 continue
@@ -307,7 +316,7 @@ class Doom:
         try:
             nb = s.notifications_buffer if s is not None else ""
             for n in str(nb or "").replace("\r", "").split("\n"):
-                n = n.strip()
+                n = "".join(ch for ch in n if ch.isprintable()).strip()
                 if not n or n.startswith("No bots file"):
                     continue
                 if n.startswith("+"):
@@ -457,9 +466,11 @@ class Doom:
             if s is not None:
                 for l in s.labels:
                     if l.object_category == "Monster" and l.object_id not in self.seen_monsters and l.width > 0:
-                        self.seen_monsters.add(l.object_id)
                         px, py = float(g.get_game_variable(vzd.GameVariable.POSITION_X)), float(g.get_game_variable(vzd.GameVariable.POSITION_Y))
                         d = math.hypot(l.object_position_x - px, l.object_position_y - py)
+                        if d > 900:
+                            continue  # a speck in the distance is not worth a turn; it stays "new" until it is closer
+                        self.seen_monsters.add(l.object_id)
                         return f"enemy sighted: {MONSTER_NAMES.get(l.object_name, l.object_name)} at {int(d)} units"
         return None
 
@@ -606,13 +617,14 @@ class Doom:
         if "weapon" in action:
             n = int(action["weapon"])
             if n not in WEAPON_NAMES:
-                raise ValueError("weapon must be 1..8 (1 fist, 2 pistol, 3 shotgun, 4 chaingun, 5 rocket, 6 plasma, 7 BFG, 8 chainsaw)")
+                raise ValueError("weapon must be 1..8 (Doom: 1 fist, 2 pistol, 3 shotgun, 4 chaingun, 5 rocket, 6 plasma, 7 BFG, 8 chainsaw; Heretic: 1 staff, 2 wand, 3 crossbow, 4 dragon claw, 5 hellstaff, 6 phoenix rod, 7 firemace, 8 gauntlets)")
             self.g.make_action(self._press(**{f"SELECT_WEAPON{n}": 1}), 2)
             self.g.make_action(self._press(), 12)
             sel = int(float(self.g.get_game_variable(vzd.GameVariable.SELECTED_WEAPON)))
+            wn = HERETIC_WEAPONS if self.game == "heretic" else WEAPON_NAMES
             if sel != n:
-                events.append(f"Could not switch to {WEAPON_NAMES[n]} (not owned or no ammo); holding {WEAPON_NAMES.get(sel, sel)}.")
-            return f"weapon {n} ({WEAPON_NAMES.get(sel, sel)})", None
+                events.append(f"Could not switch to {wn[n]} (not owned or no ammo); holding {wn.get(sel, sel)}.")
+            return f"weapon {n} ({wn.get(sel, sel)})", None
         if "wait" in action:
             tics = action["wait"]
             tics = 35 if tics is True else max(1, min(int(tics), 35 * 30))
@@ -680,6 +692,12 @@ def ray_segment(px, py, dx, dy, x1, y1, x2, y2):
 def main():
     doom = Doom()
     out = sys.stdout
+    import signal
+    def bye(*_):
+        doom.close()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
     sys.stdout = sys.stderr  # anything the engine prints must not corrupt the protocol stream
     def reply(obj):
         out.write(json.dumps(obj) + "\n")
@@ -720,6 +738,7 @@ def main():
         except Exception as e:
             log("error:", repr(e))
             reply({"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+    doom.close()  # stdin closed: the server is gone, take the engine with us
 
 
 if __name__ == "__main__":
