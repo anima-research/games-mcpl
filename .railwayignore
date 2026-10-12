@@ -1,0 +1,8 @@
+node_modules
+dist
+py/.venv
+py/__pycache__
+py/_vizdoom.ini
+data
+.env
+test
