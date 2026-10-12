@@ -14,7 +14,7 @@ ENV NODE_ENV=production PORT=8080 GAMES_HOST=0.0.0.0 GAMES_DATA_DIR=/data GAMES_
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY public ./public
-COPY py/sidecar.py ./py/sidecar.py
+COPY py/sidecar.py py/nav.py ./py/
 COPY package.json ./
 EXPOSE 8080
 CMD ["node", "dist/src/index.js"]
