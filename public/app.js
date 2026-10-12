@@ -203,7 +203,7 @@
     speed.onchange = () => { if (timer) { stop(); play(); } };
     document.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft') prevBtn.onclick(); else if (e.key === 'ArrowRight') nextBtn.onclick(); else if (e.key === ' ') { e.preventDefault(); playBtn.onclick(); } });
     api('GET', `/api/recordings/${id}`).then(({ meta, live, events }) => {
-      title.replaceChildren(`${meta.player.name} — ${meta.game} ${meta.map}`, ' ', statusBadge(meta), live ? h('a', { href: `/g/${id}`, style: 'margin-left:8px;font-size:14px' }, 'this game is live — watch it') : null);
+      title.replaceChildren(...[`${meta.player.name} — ${meta.game} ${meta.map}`, ' ', statusBadge(meta), live ? h('a', { href: `/g/${id}`, style: 'margin-left:8px;font-size:14px' }, 'this game is live — watch it') : null].filter(Boolean));
       sub.textContent = `skill ${meta.skill} · ${meta.turn} turns · ${meta.kills ?? 0} kills · ${mmss(meta.time_s)} · ${new Date(meta.createdAt).toLocaleString()}`;
       let lastFrame = null;
       for (const e of events) {
