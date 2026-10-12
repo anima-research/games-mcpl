@@ -273,7 +273,8 @@ class Doom:
         visible.sort(key=lambda o: (o["category"] != "monster", o["distance"]))
         out["visible"] = visible
         new_monsters = [o for o in visible if o["category"] == "monster" and o["id"] not in self.seen_monsters]
-        self.seen_monsters.update(o["id"] for o in visible if o["category"] == "monster")
+        # Only monsters within 900 units count as seen; a speck in the distance still earns an "enemy sighted" stop later.
+        self.seen_monsters.update(o["id"] for o in visible if o["category"] == "monster" and o["distance"] <= 900)
         out["new_monsters"] = [o["id"] for o in new_monsters]
         # nearby but not in view (monsters only — "you hear something")
         heard = []
