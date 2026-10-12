@@ -81,7 +81,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
     const method = req.method ?? 'GET';
     const sendJson = (status: number, body: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
     try {
-      if (path === '/health') { sendJson(200, { ok: true, games: app.games.sessions.size, maxGames: app.config.maxGames, engine: app.engineOk }); return; }
+      if (path === '/health') { sendJson(200, { ok: true, games: app.games.sessions.size, maxGames: app.config.maxGames, engine: app.engineOk, catalogue: Object.keys(app.games.catalogue.games), wads: app.wads }); return; }
 
       // ------------------------------------------------ sign-in
       if (path === '/auth/login' && method === 'GET') {

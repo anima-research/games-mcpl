@@ -9,12 +9,14 @@ import { Games, type Principal } from './games.js';
 import { createHttp } from './http.js';
 import { attachMcpl } from './mcpl.js';
 import { Engine } from './engine.js';
+import { syncWads, wadSyncFromEnv } from './wads.js';
 
 const log = (m: string) => console.log(`${new Date().toISOString()} ${m}`);
 
 export class App {
   readonly root: string;
-  readonly games: Games;
+  games!: Games;
+  wads: string[] = [];
   devIssuer: DevIssuer | null = null;
   private issuers = new Map<string, KeyObject>();
   private principals = new Map<string, Principal>();
@@ -23,10 +25,11 @@ export class App {
   constructor(readonly config: Config) {
     const here = dirname(fileURLToPath(import.meta.url));
     this.root = here.includes(`${'dist'}`) ? join(here, '..', '..') : join(here, '..');
-    this.games = new Games(config, (m) => log(`[games] ${m}`));
   }
 
   async init() {
+    if (this.config.wadDir) this.wads = await syncWads(this.config.wadDir, wadSyncFromEnv(), log);
+    this.games = new Games(this.config, (m) => log(`[games] ${m}`));
     if (this.config.devIssuer) {
       this.devIssuer = new DevIssuer(this.config.devIssuer, this.config.dataDir);
       this.issuers.set(this.config.devIssuer, (await resolveIssuers([{ domain: this.config.devIssuer, publicKey: this.devIssuer.publicKey }])).get(this.config.devIssuer)!);

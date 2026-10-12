@@ -10,7 +10,7 @@ Browser (viewer) ──/ws + /api──────┘
 
 - **The world only moves while the player acts.** `game_act` runs a short list of actions (move, turn, face, goto, attack, use, weapon, wait), stops early when something happens (damage, a new enemy in view, death, level end, blocked), and returns the result: status, events, what is in view with bearings and distances, "heard" monsters out of view, clearance to the nearest wall/door/ledge at seven bearings, and the rendered frame (optionally the automap). An agent that takes a minute between turns plays at exactly its own pace.
 - **Watchers** see every turn as it happens (frame, automap, HUD, the actions, the events, the player's commentary) and can chat. Chat reaches the player under "Watchers say" with their next turn, or as a `games:chat` push event when they are idle.
-- **Games:** Freedoom Phase 1 (E1M1–E4M9) and Phase 2 (MAP01–MAP32) ship with the engine. Drop `doom.wad` / `doom2.wad` / `heretic.wad` into `DOOM_WAD_DIR` (`wads/` here, gitignored) and `doom` (Ultimate Doom, 4 episodes), `doom2` (32 maps) and `heretic` (5 episodes; wand/crossbow/dragon claw, gargoyles/golems) appear too.
+- **Games:** Freedoom Phase 1 (E1M1–E4M9) and Phase 2 (MAP01–MAP32) ship with the engine. Drop `doom.wad` / `doom2.wad` / `heretic.wad` into `DOOM_WAD_DIR` (`wads/` here, gitignored; in production synced at startup from a private S3 bucket into the volume — `WADS_S3_ENDPOINT/BUCKET/PREFIX/KEY/SECRET`, rclone) and `doom` (Ultimate Doom, 4 episodes), `doom2` (32 maps) and `heretic` (5 episodes; wand/crossbow/dragon claw, gargoyles/golems) appear too.
 - **Recordings:** every game is written to `<data>/recordings/<id>/` as it is played (turn log + a frame and automap per turn, ~35 KB/turn). The lobby lists them; `/r/<id>` replays with a scrubber, play/pause, speed, HUD, turn log and chat as it happened. `GAMES_KEEP_RECORDINGS` (200) bounds the disk.
 
 ## Tools (feature set `games`)
@@ -63,7 +63,7 @@ node --import tsx test/demo.ts http://localhost:7372 100 3            # a script
 | `GAMES_DATA_DIR` | `data` | `results.jsonl`, `recordings/`, dev issuer key — a Railway volume at `/data` |
 | `GAMES_DEV_ISSUER` | none | local stand-in for the home node; refuses https origins |
 
-**Railway:** live at https://archipelago-games-production.up.railway.app (`railway up --ci --no-gitignore -s archipelago-games` deploys — `--no-gitignore` so the gitignored `wads/*.wad` ride along into the image, `.railwayignore` keeps the rest out; a redeploy ends running games — engines live in the process). `Dockerfile` builds Node + a Python venv with the ViZDoom manylinux wheel; `railway.toml` health-checks `/health`, which also reports whether the engine runs (`engine: true`). Register the audience on the home node (`config/audiences.json`, hot-reloaded):
+**Railway:** live at https://archipelago-games-production.up.railway.app (`railway up --ci -s archipelago-games` deploys; the WADs are not in the image — they come from OVH S3 `archipelago-games/wads/` at startup; a redeploy ends running games — engines live in the process). `Dockerfile` builds Node + a Python venv with the ViZDoom manylinux wheel; `railway.toml` health-checks `/health`, which also reports whether the engine runs (`engine: true`). Register the audience on the home node (`config/audiences.json`, hot-reloaded):
 
 ```json
 "games": { "redirect": "https://archipelago-games-production.up.railway.app/auth/callback", "api": "https://archipelago-games-production.up.railway.app" }
