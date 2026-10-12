@@ -187,7 +187,8 @@ export class McplSession {
   private instructions(): string {
     return [
       'Archipelago Games: play Doom turn by turn. The world only moves while game_act runs, so take your time between turns.',
-      'Start with game_start (freedoom1 E1M1 by default). Each turn: read the text (status, events, what is in view with bearings and distances, clearance to walls), look at the picture, then game_act with a short list of actions. Bearings are degrees, + = right of where you face.',
+      'Start with game_start (freedoom1 E1M1 by default). Each turn: read the text (status, events, what is in view with bearings and distances, the ways out of your area and which are unexplored, clearance to walls), look at the picture, then game_act with a short list of actions. Bearings are degrees, + = right of where you face.',
+      'Finding your way: {"explore": true} walks to the nearest area you have not visited (it routes around corners and opens doors); {"goto": id | [x, y]} does the same toward a thing or a map point. You rarely need raw turn/move for navigation — use them for aiming and small adjustments. Doors are listed under "Ways out"; {"use": true} walks to the nearest door in front of you and opens it, and tells you if there is nothing to use.',
       'People can watch your game on the web and talk to you; their words appear under "Watchers say" and, when you are idle, as a games:chat push. Answer with the say field of game_act or game_say.',
       'Dying or finishing a level ends the episode: game_start again (same map to retry, the next map to continue). Progress carries nothing over: you start each map with a pistol.',
       ACTION_HELP,

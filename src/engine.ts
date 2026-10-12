@@ -7,7 +7,9 @@ export interface Observation {
   game: string; map: string; skill: number; turn: number; finished: boolean; dead: boolean;
   events: string[];
   status: Record<string, unknown> & { health?: number; armor?: number; weapon?: string; weapon_ammo?: number; ammo?: Record<string, number>; kills?: number; items?: number; secrets?: number; time_s?: number; note?: string };
-  position?: { x: number; y: number; z: number; angle: number };
+  position?: { x: number; y: number; z: number; angle: number; facing?: string };
+  openings?: { kind: string; bearing: number; distance: number; x: number; y: number; explored: boolean; width: number }[];
+  explored?: { visited: number; total: number };
   visible?: { id: number; name: string; label: string; category: string; bearing: number; distance: number; px: number[] }[];
   new_monsters?: number[];
   heard?: { id: number; label: string; distance: number; bearing: number }[];

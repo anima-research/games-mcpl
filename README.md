@@ -25,7 +25,7 @@ Browser (viewer) ──/ws + /api──────┘
 | `game_say {text}` / `game_watchers` | talk to / list the people watching |
 | `game_stop` / `game_results` | end your game / recent results |
 
-Actions: `{"move":"forward|back|left|right","tics":35}` · `{"turn":±deg}` · `{"face":id|[x,y]}` · `{"goto":id|[x,y],"within":48}` · `{"attack":n}` · `{"use":true}` · `{"weapon":1..8}` · `{"wait":tics}`. Bearings are degrees, **+ = right**. 35 tics = 1 s.
+Actions: `{"move":"forward|back|left|right","tics":35}` · `{"turn":±deg}` · `{"face":id|[x,y]}` · `{"goto":id|[x,y],"within":48}` (real route: A* over the sector graph, opens doors on the way) · `{"explore":true}` (nearest unvisited area) · `{"attack":n}` · `{"use":true}` (walks to the nearest door in front and opens it; says so when nothing is there) · `{"weapon":1..8}` · `{"wait":tics}`. Bearings are degrees, **+ = right**. 35 tics = 1 s. Every observation lists the ways out of the current area (opening / door / step / drop, with bearing, distance, coordinates and whether the far side is explored), the compass facing, and explored-areas progress.
 
 ## For a resident
 
@@ -74,5 +74,6 @@ node --import tsx test/demo.ts http://localhost:7372 100 3            # a script
 - ViZDoom ignores input for the first ~7 tics of an episode; `start` burns 10.
 - `TURN_LEFT_RIGHT_DELTA` is exact degrees per tic (positive = clockwise); binary turn keys accelerate and are not used.
 - Ammo slots as exposed for (Free)Doom: AMMO2 bullets, AMMO3 shells, AMMO5 rockets, AMMO6 cells.
+- Navigation (`py/nav.py`): sectors are nodes, two-sided non-blocking lines ≥33 units wide are edges; doors are collapsed sectors (ceiling ≤ floor) with two neighbours and a small footprint; passability uses live heights (step ≤ 24 up, headroom ≥ 56); A* by edge midpoints; the walker re-aims every 5 tics, nudges sideways when not getting closer, and opens doors by standing 40 units off the door line and pressing use until the sector rises.
 - Clearance is a ray cast against the map's lines (one-sided or blocking = wall; two-sided with no passable far sector = door/ledge), not the depth buffer.
 - Each `act` is ~15–30 ms of engine time; frames are 320×240 JPEG (~25 KB).

@@ -26,6 +26,9 @@ import time
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nav import NavMap, compass  # noqa: E402
+
 try:
     import vizdoom as vzd
     from PIL import Image
@@ -129,6 +132,9 @@ class Doom:
         self.frames_dir = os.environ.get("DOOM_FRAMES_DIR", "")
         self.action_log = []
         self.notes = []       # HUD messages seen during the current act
+        self.nav = None       # NavMap for the current episode
+        self.visited = set()  # sector ids the player has stood in
+        self.gave_up = {}     # sector id -> failed explore attempts (2 = skip it)
 
     # ── lifecycle ──
     def start(self, game="freedoom1", map=None, skill=3, width=320, height=240, image="frame", image_scale=1.0):
@@ -184,6 +190,11 @@ class Doom:
         # turns and moves issued in tics 1-6 are dropped) — burn them here so the
         # agent's first action counts.
         self.g.make_action([0] * len(BUTTONS), 10)
+        st = self.g.get_state()
+        self.nav = NavMap(st.sectors) if st is not None and st.sectors else None
+        self.visited = set()
+        self.gave_up = {}
+        self._mark_visited(st)
         return self.observe(events=[f"Started {game} {map} on skill {skill} ({SKILLS[skill]})."], image=image, image_scale=float(image_scale))
 
     @staticmethod
@@ -254,7 +265,17 @@ class Doom:
             "secrets": int(v[GI[vzd.GameVariable.SECRETCOUNT]]),
             "time_s": round(g.get_episode_time() / TICS_PER_SEC, 1),
         }
-        out["position"] = {"x": round(px), "y": round(py), "z": round(pz), "angle": round(pa) % 360}
+        out["position"] = {"x": round(px), "y": round(py), "z": round(pz), "angle": round(pa) % 360, "facing": compass(pa)}
+        here = self._mark_visited(s)
+        if self.nav is not None and here is not None:
+            ops = []
+            for o in self.nav.openings(here, px, py, s.sectors, self.visited)[:6]:
+                rel = ang_norm(math.degrees(math.atan2(o["y"] - py, o["x"] - px)) - pa)
+                ops.append({"kind": o["kind"], "bearing": round(-rel), "distance": round(o["distance"]), "x": round(o["x"]), "y": round(o["y"]),
+                            "explored": o["explored"], "width": o["width"]})
+            out["openings"] = ops
+            walkable = self.nav.n - len(self.nav.door_like)
+            out["explored"] = {"visited": len(self.visited - self.nav.door_like), "total": walkable}
         # what is in view
         W, H = self.res
         visible, seen_ids = [], set()
@@ -312,6 +333,27 @@ class Doom:
             except Exception as e:
                 log("frame save failed:", e)
         return out
+
+    def _me(self, s):
+        for o in s.objects:
+            if o.category == "Self":
+                return o
+        return None
+
+    def _player_sector(self, s=None):
+        s = s if s is not None else self.g.get_state()
+        if s is None or self.nav is None:
+            return None
+        me = self._me(s)
+        if me is not None and 0 <= me.sector_id < self.nav.n:
+            return int(me.sector_id)
+        return self.nav.point_sector(float(self.g.get_game_variable(vzd.GameVariable.POSITION_X)), float(self.g.get_game_variable(vzd.GameVariable.POSITION_Y)))
+
+    def _mark_visited(self, s=None):
+        sec = self._player_sector(s)
+        if sec is not None:
+            self.visited.add(sec)
+        return sec
 
     def _collect_notes(self, s):
         try:
@@ -463,6 +505,8 @@ class Doom:
         watch["health"] = h
         s = g.get_state()
         self._collect_notes(s)
+        if s is not None:
+            self._mark_visited(s)
         if "enemy" in stop_on:
             if s is not None:
                 for l in s.labels:
@@ -540,18 +584,42 @@ class Doom:
                 b, d = self._bearing_to(o.position_x, o.position_y)
                 what = f"{MONSTER_NAMES.get(o.name, o.name)} #{o.id} ({int(d)} units)"
             return f"face {what}: turned {int(b)}°", self._turn(b, stop_on, watch)
+        if "explore" in action:
+            max_tics = max(10, min(int(action.get("max_tics", 35 * 12)), 35 * 30))
+            s = self.g.get_state()
+            here = self._player_sector(s)
+            if self.nav is None or here is None:
+                return "explore (no map)", None
+            px, py = self._pos()
+            skip = self.visited | {k for k, v in self.gave_up.items() if v >= 2}
+            found = self.nav.nearest_unexplored_cell(px, py, s.sectors, skip)
+            if not found:
+                events.append("explore: every reachable area has been visited — look for doors that need a key or a switch.")
+                return "explore: nothing unvisited reachable", None
+            cell, target = found
+            tx, ty = self.nav.cell_xy(cell)
+            desc, reason = self._navigate(tx, ty, target, f"unexplored area #{target}", 12, max_tics, stop_on, watch, events, run, enter_only=True)
+            if target not in self.visited and (reason and "stuck" in reason or "did not get in" in desc):
+                self.gave_up[target] = self.gave_up.get(target, 0) + 1
+                if self.gave_up[target] >= 2:
+                    events.append(f"explore: giving up on area #{target} (can't get in from here); moving on to other areas.")
+            return "explore → " + desc, reason
         if "goto" in action:
             tgt = action["goto"]
             stop_dist = float(action.get("within", 48))
-            max_tics = max(10, min(int(action.get("max_tics", 35 * 8)), 35 * 20))
+            max_tics = max(10, min(int(action.get("max_tics", 35 * 12)), 35 * 30))
             if isinstance(tgt, (list, tuple)) and len(tgt) == 2:
                 tx, ty, what = float(tgt[0]), float(tgt[1]), f"({int(tgt[0])},{int(tgt[1])})"
+                tsec = self.nav.point_sector(tx, ty) if self.nav else None
             else:
                 o = self._find_object(int(tgt))
                 if o is None:
                     events.append(f"goto: object #{tgt} is no longer in the map (picked up, destroyed or never existed).")
                     return f"goto #{tgt} (gone)", None
                 tx, ty, what = o.position_x, o.position_y, f"{MONSTER_NAMES.get(o.name, o.name)} #{o.id}"
+                tsec = int(o.sector_id) if 0 <= o.sector_id < (self.nav.n if self.nav else 0) else (self.nav.point_sector(tx, ty) if self.nav else None)
+            if self.nav is not None and tsec is not None:
+                return self._navigate(tx, ty, tsec, what, stop_dist, max_tics, stop_on, watch, events, run)
             used = 0
             x0, y0 = self._pos()
             while used < max_tics:
@@ -612,9 +680,26 @@ class Doom:
                 return desc, f"{close[0]} #{close[2]} still up at {close[1]} units"
             return desc, None
         if "use" in action:
+            s = self.g.get_state()
+            door = self._nearest_door_line(s) if s is not None else None
+            if door is not None:
+                ok, r = self._open_door(door.b, door.mx, door.my, stop_on, watch)
+                if ok:
+                    return "use: door opened", None
+                return "use: door did not open", r
+            # no door in reach: press anyway (switches), then say whether anything moved
+            before = [(sec.floor_height, sec.ceiling_height) for sec in s.sectors] if s is not None else None
             self.g.make_action(self._press(USE=1), 2)
             r = self._step(self._press(), int(action.get("tics", 25)), stop_on, watch)
-            return "use (open door / press switch), waited 25 tics", r
+            s2 = self.g.get_state()
+            moved = 0
+            if before is not None and s2 is not None:
+                moved = sum(1 for a, sec in zip(before, s2.sectors) if (sec.floor_height, sec.ceiling_height) != a)
+            if moved:
+                events.append(f"use: something moved ({moved} sector(s) changed height) — a switch worked.")
+                return "use: switch pressed, something moved", r
+            events.append("use: nothing here to use — no door within reach in front of you and nothing moved. Doors are listed under 'Openings'; stand within ~60 units facing one.")
+            return "use: nothing happened", r
         if "weapon" in action:
             n = int(action["weapon"])
             if n not in WEAPON_NAMES:
@@ -634,6 +719,152 @@ class Doom:
 
     def _pos(self):
         return float(self.g.get_game_variable(vzd.GameVariable.POSITION_X)), float(self.g.get_game_variable(vzd.GameVariable.POSITION_Y))
+
+    # ── navigation ──
+    def _walk_to(self, tx, ty, within, budget, stop_on, watch, run=True):
+        """Straight run to a point with re-aiming, stuck recovery. Returns (tics_used, reason|None, arrived)."""
+        used = 0
+        best_d = float("inf")
+        no_progress = 0      # tics without getting closer
+        nudges = 0
+        while used < budget:
+            b, d = self._bearing_to(tx, ty)
+            if d <= within:
+                return used, None, True
+            if d < best_d - 4:
+                best_d, no_progress = d, 0
+            if abs(b) > 4:
+                r = self._turn(b, stop_on, watch)
+                if r:
+                    return used, r, False
+            r = self._step(self._press(MOVE_FORWARD=1, SPEED=1 if run else 0), 5, stop_on, watch)
+            used += 5
+            no_progress += 5
+            if r:
+                return used, r, False
+            if no_progress >= 15:
+                # not getting closer: hand back to the planner (it re-routes from where we actually are)
+                return used, "replan", False
+        return used, None, False
+
+    def _open_door(self, door_sector, mx, my, stop_on, watch):
+        """Stand before the door line, press use, wait for it to rise. Returns (ok, reason)."""
+        used, r, arrived = self._walk_to(mx, my, 36, 35 * 4, stop_on, watch)
+        if r:
+            return False, r
+        b, _ = self._bearing_to(mx, my)
+        self._turn(b, stop_on, watch)
+        for attempt in range(2):
+            self.g.make_action(self._press(USE=1), 2)
+            for _ in range(10):
+                self.g.make_action(self._press(), 5)
+                s = self.g.get_state()
+                if s is None:
+                    return False, "episode ended"
+                if not self.nav.closed(door_sector, s.sectors):
+                    self.g.make_action(self._press(), 10)  # let it rise a little more
+                    return True, None
+            # nudge closer and retry once
+            self.g.make_action(self._press(MOVE_FORWARD=1), 6)
+        s = self.g.get_state()
+        return False, "the door would not open (locked — needs a key or a switch elsewhere?)"
+
+    def _navigate(self, tx, ty, tsec, what, within, max_tics, stop_on, watch, events, run=True, enter_only=False):
+        used = 0
+        replans = 0
+        no_gain = 0
+        last_pos = self._pos()
+        desc_path = "?"
+        doors_opened = 0
+        while True:
+            s = self.g.get_state()
+            if s is None:
+                return f"goto {what}", "episode ended"
+            px, py = self._pos()
+            cells = self.nav.path_cells(px, py, tx, ty, s.sectors)
+            if cells is None:
+                if replans == 0:
+                    events.append(f"goto {what}: no walkable route from here (a locked door, a lift or a ledge is in the way) — trying a straight run.")
+                wps = [("walk", tx, ty)]
+            else:
+                wps = self.nav.waypoints(cells, s.sectors)
+            if replans == 0:
+                doors = sum(1 for w in wps if w[0] == "door")
+                legs = sum(1 for w in wps if w[0] == "walk")
+                desc_path = f"{legs} leg(s), {doors} door(s)" if cells is not None else "straight line"
+            outcome = None   # "done" | "replan" | reason
+            for w in wps:
+                if used >= max_tics:
+                    outcome = "time"
+                    break
+                if w[0] == "door":
+                    _, dsec, dx, dy = w
+                    if self.nav.closed(dsec, self.g.get_state().sectors):
+                        ok, r = self._open_door(dsec, dx, dy, stop_on, watch)
+                        if not ok:
+                            return f"goto {what}: stopped at a door", r
+                        doors_opened += 1
+                        events.append("Opened a door.")
+                    continue
+                _, wx, wy = w
+                last = w is wps[-1]
+                n, r, arrived = self._walk_to(wx, wy, within if last else 14, max_tics - used, stop_on, watch, run)
+                used += n
+                if r == "replan":
+                    outcome = "replan"
+                    break
+                if r:
+                    return f"goto {what} (en route, {desc_path})", r
+                if not arrived:
+                    outcome = "time"
+                    break
+            else:
+                outcome = "done"
+            if outcome == "done":
+                break
+            if outcome == "time":
+                return f"goto {what}: out of time on the way ({desc_path})", None
+            # replan: did we get anywhere since the last replan?
+            qx, qy = self._pos()
+            if math.hypot(qx - last_pos[0], qy - last_pos[1]) < 12:
+                no_gain += 1
+                # a small sideways shuffle to unhook from a corner, alternating sides
+                self.g.make_action(self._press(**{"MOVE_LEFT" if no_gain % 2 else "MOVE_RIGHT": 1}), 5)
+                used += 5
+            else:
+                no_gain = 0
+            last_pos = (qx, qy)
+            replans += 1
+            if no_gain >= 3 or replans >= 12:
+                return f"goto {what} ({desc_path})", "stuck (wall, pillar or obstacle in the way)"
+        self._brake()
+        via = desc_path + (f", re-routed {replans}×" if replans else "")
+        if enter_only:
+            here = self._mark_visited()
+            if here == tsec or tsec in self.visited:
+                return f"goto {what}: entered it ({via})", None
+            return f"goto {what}: reached its edge but did not get in ({via})", None
+        _, d = self._bearing_to(tx, ty)
+        if d <= within + 8:
+            return f"goto {what}: arrived ({int(d)} units away, {via})", None
+        return f"goto {what}: ended {int(d)} units short ({via})", None
+
+    def _nearest_door_line(self, s, max_dist=120, max_bearing=70):
+        """Nearest door-line (edge into a door-like sector) in front of the player."""
+        here = self._player_sector(s)
+        if self.nav is None or here is None:
+            return None
+        px, py = self._pos()
+        pa = float(self.g.get_game_variable(vzd.GameVariable.ANGLE))
+        best = None
+        for e in self.nav.edges.get(here, []):
+            if e.b not in self.nav.door_like:
+                continue
+            d = math.hypot(e.mx - px, e.my - py)
+            rel = abs(ang_norm(math.degrees(math.atan2(e.my - py, e.mx - px)) - pa))
+            if d <= max_dist and rel <= max_bearing and (best is None or d < best[0]):
+                best = (d, e)
+        return best[1] if best else None
 
     def _brake(self):
         """Doom keeps sliding after you let go; six idle tics settle the player before the next action."""
