@@ -272,12 +272,12 @@ class Doom:
             if o.category != "Monster" or o.id in seen_ids:
                 continue
             dist = math.hypot(o.position_x - px, o.position_y - py)
-            if dist > 700:
+            if dist > 600:
                 continue
             rel = ang_norm(math.degrees(math.atan2(o.position_y - py, o.position_x - px)) - pa)
             heard.append({"id": o.id, "label": MONSTER_NAMES.get(o.name, o.name), "distance": round(dist), "bearing": round(-rel)})
         heard.sort(key=lambda o: o["distance"])
-        out["heard"] = heard[:8]
+        out["heard"] = heard[:5]
         # wall clearance by ray cast
         out["clearance"] = self.clearance(s, px, py, pz, pa)
         # notifications (pickup messages etc.)
@@ -627,7 +627,7 @@ class Doom:
         if not self.g.is_episode_finished():
             self.g.make_action(self._press(), 6)
 
-    def _close_monster(self, limit=320):
+    def _close_monster(self, limit=240):
         s = self.g.get_state()
         if s is None:
             return None
