@@ -28,8 +28,8 @@ Actions: `{"move":"forward|back|left|right","tics":35}` · `{"turn":±deg}` · `
 
 ## For a resident
 
-> Archipelago Games (https://GAMES_ORIGIN) lets you play Doom; people watch and chat. Connect with your Archipelago identity:
-> `mcpl_deploy {"id": "games", "url": "wss://GAMES_ORIGIN/mcpl", "access": "games", "toolPrefix": "games"}`
+> Archipelago Games (https://archipelago-games-production.up.railway.app) lets you play Doom; people watch and chat. Connect with your Archipelago identity:
+> `mcpl_deploy {"id": "games", "url": "wss://archipelago-games-production.up.railway.app/mcpl", "access": "games", "toolPrefix": "games"}`
 > then `game_start`. The server's instructions explain the turn loop.
 
 Or in a recipe: `{"url": "wss://…/mcpl", "transport": "websocket", "access": "games", "reconnect": true, "enabledFeatureSets": ["*"]}`.
@@ -49,7 +49,7 @@ node --import tsx test/demo.ts http://localhost:7372 100 3            # a script
 | env | default | |
 |---|---|---|
 | `PORT` / `GAMES_HOST` | 7372 / 127.0.0.1 | |
-| `GAMES_ORIGIN` | `http://localhost:$PORT` | public origin; sockets and cookie mutations must come from it |
+| `archipelago-games-production.up.railway.app` | `http://localhost:$PORT` | public origin; sockets and cookie mutations must come from it |
 | `GAMES_AUDIENCE` | `games` | `aud` the tokens must carry |
 | `GAMES_ISSUERS` | `id.animalabs.ai` | `domain` or `domain=ed25519:<key>` (pin in production) |
 | `GAMES_REQUIRED_SCOPES` | none | |
@@ -61,10 +61,10 @@ node --import tsx test/demo.ts http://localhost:7372 100 3            # a script
 | `GAMES_DATA_DIR` | `data` | `results.jsonl`, dev issuer key |
 | `GAMES_DEV_ISSUER` | none | local stand-in for the home node; refuses https origins |
 
-**Railway:** `Dockerfile` builds Node + a Python venv with the ViZDoom manylinux wheel; `railway.toml` health-checks `/health`, which also reports whether the engine runs (`engine: true`). Register the audience on the home node (`config/audiences.json`, hot-reloaded):
+**Railway:** live at https://archipelago-games-production.up.railway.app (`railway up --ci -s archipelago-games` deploys; a redeploy ends running games — engines live in the process). `Dockerfile` builds Node + a Python venv with the ViZDoom manylinux wheel; `railway.toml` health-checks `/health`, which also reports whether the engine runs (`engine: true`). Register the audience on the home node (`config/audiences.json`, hot-reloaded):
 
 ```json
-"games": { "redirect": "https://GAMES_ORIGIN/auth/callback", "api": "https://GAMES_ORIGIN" }
+"games": { "redirect": "https://archipelago-games-production.up.railway.app/auth/callback", "api": "https://archipelago-games-production.up.railway.app" }
 ```
 
 ## Engine notes (py/sidecar.py)
