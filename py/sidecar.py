@@ -137,7 +137,7 @@ class Doom:
         self.gave_up = {}     # sector id -> failed explore attempts (2 = skip it)
 
     # ── lifecycle ──
-    def start(self, game="freedoom1", map=None, skill=3, width=320, height=240, image="frame", image_scale=1.0):
+    def start(self, game="freedoom1", map=None, skill=3, width=320, height=240, image="frame", image_scale=1.0, load=None, visited=None, gave_up=None, turn=0):
         if game not in GAMES:
             raise ValueError(f"unknown game {game!r}; available: {', '.join(GAMES)}")
         maps = GAMES[game]["maps"]
@@ -190,12 +190,36 @@ class Doom:
         # turns and moves issued in tics 1-6 are dropped) — burn them here so the
         # agent's first action counts.
         self.g.make_action([0] * len(BUTTONS), 10)
+        events = [f"Started {game} {map} on skill {skill} ({SKILLS[skill]})."]
+        if load:
+            if not os.path.exists(f"{load}.zds"):
+                raise RuntimeError(f"no save file {load}.zds in {os.getcwd()}")
+            self.g.send_game_command(f"load {load}")
+            self.g.make_action([0] * len(BUTTONS), 12)
+            self.turns = int(turn or 0)
+            events = [f"Resumed {game} {map} from the autosave (turn {self.turns}) after a server restart — carry on."]
         st = self.g.get_state()
         self.nav = NavMap(st.sectors) if st is not None and st.sectors else None
-        self.visited = set()
-        self.gave_up = {}
+        self.visited = set(int(v) for v in (visited or []))
+        self.gave_up = {int(k): int(v) for k, v in (gave_up or {}).items()}
         self._mark_visited(st)
-        return self.observe(events=[f"Started {game} {map} on skill {skill} ({SKILLS[skill]})."], image=image, image_scale=float(image_scale))
+        return self.observe(events=events, image=image, image_scale=float(image_scale))
+
+    def save(self, name="autosave"):
+        """Write a ZDoom savegame (<name>.zds in the engine's cwd) plus the navigation memory. Only while the episode is live."""
+        self.require()
+        if self.finished():
+            return {"saved": False, "reason": "episode over"}
+        self.g.send_game_command(f"save {name} games-mcpl-autosave")
+        before = os.path.getmtime(f"{name}.zds") if os.path.exists(f"{name}.zds") else None
+        ok = False
+        for _ in range(8):                           # the engine writes the file a few tics later
+            self.g.make_action([0] * len(BUTTONS), 5)
+            if os.path.exists(f"{name}.zds") and os.path.getmtime(f"{name}.zds") != before:
+                ok = True
+                break
+        ok = ok or os.path.exists(f"{name}.zds")
+        return {"saved": ok, "file": os.path.abspath(f"{name}.zds"), "visited": sorted(self.visited), "gave_up": self.gave_up, "turn": self.turns}
 
     @staticmethod
     def _resolution(res):
@@ -957,6 +981,8 @@ def main():
                 res = doom.observe(image=args.get("image", "frame"), image_scale=float(args.get("image_scale", 1.0)))
             elif op == "state":
                 res = doom.observe(image="none")
+            elif op == "save":
+                res = doom.save(args.get("name", "autosave"))
             elif op == "stop":
                 doom.close()
                 res = {"stopped": True}

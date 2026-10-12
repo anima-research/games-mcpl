@@ -48,6 +48,7 @@ export class App {
       this.engineOk = false;
       log(`[engine] NOT WORKING: ${(e as Error).message}`);
     } finally { probe.kill(); }
+    if (this.engineOk) await this.games.resumeAll();
   }
 
   verify(token: string): Identity {

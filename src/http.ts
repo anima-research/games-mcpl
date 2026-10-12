@@ -1,7 +1,7 @@
 // HTTP: sign-in (Archipelago redirect → session cookie), the viewer API, the
 // viewer WebSocket stream (/ws), static files, health.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Fault, JtiCache, opaque, tokenHash, type Identity } from './auth.js';
@@ -28,7 +28,13 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
   const production = app.config.origin.startsWith('https:');
   const cookie = (name: string, value: string, maxAge: number) => `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.max(0, Math.floor(maxAge))}${production ? '; Secure' : ''}`;
   const SESSION_MS = app.config.sessionDays * 86400_000;
+  // Browser sessions persist on disk so a redeploy does not sign everyone out.
+  const sessionsFile = join(app.config.dataDir, 'sessions.json');
   const sessions = new Map<string, Session>();
+  try {
+    if (existsSync(sessionsFile)) for (const [k, v] of Object.entries(JSON.parse(readFileSync(sessionsFile, 'utf8')) as Record<string, Session>)) if (v.expires > Date.now()) sessions.set(k, v);
+  } catch (e) { log(`sessions load failed: ${(e as Error).message}`); }
+  const saveSessions = () => { try { mkdirSync(app.config.dataDir, { recursive: true }); writeFileSync(sessionsFile, JSON.stringify(Object.fromEntries(sessions)), { mode: 0o600 }); } catch (e) { log(`sessions save failed: ${(e as Error).message}`); } };
   const jti = new JtiCache();
   const publicDir = join(app.root, 'public');
   // Chat: at most 12 messages a minute per person.
@@ -44,6 +50,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
     const token = opaque();
     sessions.set(tokenHash(token), { identity, expires: Date.now() + SESSION_MS, created: Date.now() });
     for (const [k, s] of sessions) if (s.expires < Date.now()) sessions.delete(k);
+    saveSessions();
     return { token, maxAge: SESSION_MS / 1000 };
   };
   const sessionActor = (req: IncomingMessage): Principal | null => {
@@ -104,7 +111,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
         if (!who.jti || !jti.use(who.jti, who.exp)) throw new Fault(401, 'This sign-in link was already used.');
         const actor = app.admit(who);
         const previous = cookies(req).games_session;
-        if (previous) sessions.delete(tokenHash(previous));
+        if (previous) { sessions.delete(tokenHash(previous)); saveSessions(); }
         const s = createSession(who);
         res.setHeader('Set-Cookie', [cookie('games_session', s.token, s.maxAge), cookie('games_login', '', 0)]);
         sendJson(200, { you: publicActor(actor) });
@@ -113,7 +120,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
       if (path === '/auth/logout' && method === 'POST') {
         sameOrigin(req);
         const t = cookies(req).games_session;
-        if (t) sessions.delete(tokenHash(t));
+        if (t) { sessions.delete(tokenHash(t)); saveSessions(); }
         res.setHeader('Set-Cookie', cookie('games_session', '', 0));
         sendJson(200, { ok: true });
         return;

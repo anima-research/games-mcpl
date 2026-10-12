@@ -56,8 +56,8 @@ export function nextMap(game: string, map: string, cat: Catalogue): string | nul
 }
 
 export class GameSession {
-  readonly id = `g${randomBytes(4).toString('hex')}`;
-  readonly createdAt = Date.now();
+  readonly id: string;
+  readonly createdAt: number;
   lastActiveAt = Date.now();
   endedAt?: number;
   status: GameStatus = 'running';
@@ -75,7 +75,10 @@ export class GameSession {
   /** Serializes the player's own calls so two hosts can't interleave turns. */
   busy = false;
 
-  constructor(readonly owner: Principal, readonly game: string, public map: string, readonly skill: number, readonly engine: Engine) {}
+  constructor(readonly owner: Principal, readonly game: string, public map: string, readonly skill: number, readonly engine: Engine, id?: string, createdAt?: number) {
+    this.id = id ?? `g${randomBytes(4).toString('hex')}`;
+    this.createdAt = createdAt ?? Date.now();
+  }
 
   record(obs: Observation, actions: unknown[], say: string | undefined, by: TurnRecord['by'] = 'agent'): TurnRecord {
     this.lastActiveAt = Date.now();
@@ -176,14 +179,17 @@ export class Games extends EventEmitter {
         existing.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
         this.emit('turn', existing, existing.log[existing.log.length - 1]);
         this.emit('list');
+        await this.autosave(existing);
         return { session: existing, obs };
       });
     }
     if (existing) await this.end(existing, 'stopped', 'replaced by a new game');
     if (this.sessions.size >= this.config.maxGames) throw new Fault(503, `All ${this.config.maxGames} game slots are busy right now; try again in a little while.`);
 
-    const engine = new Engine(this.config.python, this.config.sidecar, { ...(this.config.wadDir ? { DOOM_WAD_DIR: this.config.wadDir } : {}) }, (m) => this.log(`[${owner.name}] ${m}`));
-    const session = new GameSession(owner, game, map, skill, engine);
+    const id = `g${randomBytes(4).toString('hex')}`;
+    const cwd = this.recordings.prepare(id);
+    const engine = new Engine(this.config.python, this.config.sidecar, { ...(this.config.wadDir ? { DOOM_WAD_DIR: this.config.wadDir } : {}) }, (m) => this.log(`[${owner.name}] ${m}`), cwd);
+    const session = new GameSession(owner, game, map, skill, engine, id);
     this.sessions.set(session.id, session);
     this.byOwner.set(owner.sub, session);
     this.emit('list');
@@ -192,6 +198,7 @@ export class Games extends EventEmitter {
       session.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
       this.emit('turn', session, session.log[session.log.length - 1]);
       this.emit('list');
+      await this.autosave(session);
       this.log(`${owner.name} started ${game} ${map} (skill ${skill}) as ${session.id}`);
       return { session, obs };
     } catch (e) {
@@ -207,6 +214,7 @@ export class Games extends EventEmitter {
       const rec = session.record(obs, actions, opts.say);
       this.emit('turn', session, rec);
       this.emit('list');
+      await this.autosave(session);
       return { session, obs };
     });
   }
@@ -247,6 +255,55 @@ export class Games extends EventEmitter {
     return msg;
   }
 
+  // ---------------------------------------------------------------- persistence
+
+  /** After every turn: ZDoom savegame + state.json, so a server restart can pick the game back up. */
+  private async autosave(session: GameSession) {
+    if (session.status !== 'running') { this.recordings.writeState(session.id, { ...this.stateOf(session), resumable: false }); return; }
+    try {
+      const r = await session.engine.call<{ saved: boolean; visited?: number[]; gave_up?: Record<string, number>; turn?: number; reason?: string }>('save', { name: 'autosave' }, 20_000);
+      this.recordings.writeState(session.id, { ...this.stateOf(session), resumable: !!r.saved, visited: r.visited ?? [], gave_up: r.gave_up ?? {}, savedAt: Date.now() });
+    } catch (e) { this.log(`autosave ${session.id} failed: ${(e as Error).message}`); }
+  }
+
+  private stateOf(session: GameSession) {
+    return { id: session.id, owner: session.owner, game: session.game, map: session.map, skill: session.skill, createdAt: session.createdAt, turn: session.turn, lastSay: session.lastSay ?? null, status: session.status };
+  }
+
+  /** Bring back the games that were running when the server last stopped. */
+  async resumeAll() {
+    for (const id of this.recordings.resumable()) {
+      const st = this.recordings.readState(id);
+      if (!st || !st.owner || this.sessions.size >= this.config.maxGames) continue;
+      const owner: Principal = st.owner;
+      const engine = new Engine(this.config.python, this.config.sidecar, { ...(this.config.wadDir ? { DOOM_WAD_DIR: this.config.wadDir } : {}) }, (m) => this.log(`[${owner.name}] ${m}`), this.recordings.path(id));
+      const session = new GameSession(owner, st.game, st.map, st.skill, engine, id, st.createdAt);
+      session.turn = st.turn ?? 0;
+      session.lastSay = st.lastSay ?? undefined;
+      // replay the recorded log and chat so watchers and the player see history
+      for (const e of this.recordings.events(id) as any[]) {
+        if (e?.type === 'turn' && e.record) session.log.push(e.record);
+        else if (e?.type === 'chat' && e.message) session.chat.push(e.message);
+      }
+      if (session.log.length > 600) session.log.splice(0, session.log.length - 600);
+      this.sessions.set(id, session);
+      this.byOwner.set(owner.sub, session);
+      try {
+        const obs = await engine.call<Observation>('start', { game: st.game, map: st.map, skill: st.skill, image: 'none', load: 'autosave', visited: st.visited ?? [], gave_up: st.gave_up ?? {}, turn: st.turn ?? 0 }, 90_000);
+        session.turn = obs.turn ?? session.turn;
+        const rec = session.record(obs, [], undefined, 'system');
+        rec.events = [`Resumed after a server restart (turn ${session.turn}).`];
+        this.emit('turn', session, rec);
+        this.log(`resumed ${owner.name}'s ${st.game} ${st.map} (${id}) at turn ${session.turn}`);
+        await this.autosave(session);
+      } catch (e) {
+        this.log(`could not resume ${id}: ${(e as Error).message}`);
+        await this.end(session, 'stopped', `could not resume after restart: ${(e as Error).message}`);
+      }
+    }
+    this.emit('list');
+  }
+
   // ---------------------------------------------------------------- lifecycle
 
   async end(session: GameSession, status: GameStatus, why: string): Promise<void> {
@@ -256,6 +313,7 @@ export class Games extends EventEmitter {
     if (session.status === 'running') session.status = status;
     session.endedAt = Date.now();
     session.engine.kill();
+    this.recordings.writeState(session.id, { ...this.stateOf(session), resumable: false });
     const pub = session.public();
     this.recent.unshift(pub);
     this.recent.splice(30);
@@ -273,9 +331,13 @@ export class Games extends EventEmitter {
     }
   }
 
+  /** Stop without ending: every running game stays resumable (autosaved after its last turn). */
   async shutdown() {
     clearInterval(this.sweeper);
-    for (const s of [...this.sessions.values()]) await this.end(s, 'stopped', 'server shutting down');
+    for (const s of [...this.sessions.values()]) {
+      if (s.status === 'running') { this.recordings.writeState(s.id, { ...(this.recordings.readState(s.id) ?? {}), ...this.stateOf(s), resumable: this.recordings.hasSave(s.id) }); s.engine.kill(); }
+      else await this.end(s, s.status, 'server shutting down');
+    }
   }
 
   private loadRecent() {

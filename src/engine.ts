@@ -38,13 +38,13 @@ export class Engine {
   public closed = false;
   public hello: Record<string, unknown> | null = null;
 
-  constructor(private python: string, private script: string, private env: Record<string, string>, private log: (m: string) => void) {}
+  constructor(private python: string, private script: string, private env: Record<string, string>, private log: (m: string) => void, private cwd?: string) {}
 
   /** Spawn the process and wait for its hello line. */
   start(): Promise<void> {
     if (this.readyPromise) return this.readyPromise;
     this.readyPromise = new Promise<void>((resolve, reject) => {
-      const proc = spawn(this.python, ['-I', this.script], { env: { ...process.env, ...this.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+      const proc = spawn(this.python, ['-I', this.script], { env: { ...process.env, ...this.env }, stdio: ['pipe', 'pipe', 'pipe'], ...(this.cwd ? { cwd: this.cwd } : {}) });
       this.proc = proc;
       let greeted = false;
       const helloTimer = setTimeout(() => { if (!greeted) { reject(new EngineError('engine did not start in time')); this.kill(); } }, 60_000);

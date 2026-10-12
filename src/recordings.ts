@@ -20,16 +20,25 @@ export class Recordings {
     mkdirSync(this.dir, { recursive: true });
   }
 
-  private path(id: string, ...rest: string[]) { return join(this.dir, id, ...rest); }
+  path(id: string, ...rest: string[]) { return join(this.dir, id, ...rest); }
+
+  /** Create the recording directory up front (the engine runs with it as cwd, for autosaves). */
+  prepare(id: string) { mkdirSync(this.path(id, 'f'), { recursive: true }); mkdirSync(this.path(id, 'm'), { recursive: true }); if (!this.frameCount.has(id)) this.frameCount.set(id, 0); return this.path(id); }
+
+  writeState(id: string, state: unknown) { try { writeFileSync(this.path(id, 'state.json'), JSON.stringify(state)); } catch (e) { this.log(`state write ${id} failed: ${(e as Error).message}`); } }
+  readState<T = any>(id: string): T | null { try { return JSON.parse(readFileSync(this.path(id, 'state.json'), 'utf8')); } catch { return null; } }
+  hasSave(id: string) { return existsSync(this.path(id, 'autosave.zds')); }
+  /** Ids of recordings whose state says they were running when the server last stopped. */
+  resumable(): string[] { return this.ids().filter((id) => this.readState(id)?.resumable === true && this.hasSave(id)); }
 
   /** Called on every turn record (including the system "start" record and say-only records). */
   turn(session: GameSession, record: TurnRecord) {
     try {
       const id = session.id;
       if (!this.frameCount.has(id)) {
-        mkdirSync(this.path(id, 'f'), { recursive: true });
-        mkdirSync(this.path(id, 'm'), { recursive: true });
-        this.frameCount.set(id, 0);
+        this.prepare(id);
+        // resuming: continue frame numbering after what is already on disk
+        try { const n = readdirSync(this.path(id, 'f')).filter((f) => f.endsWith('.jpg')).length; this.frameCount.set(id, n); } catch { /* 0 */ }
       }
       let frame: number | null = null;
       if (session.frame && (record.actions.length > 0 || record.by === 'system')) {
@@ -86,7 +95,7 @@ export class Recordings {
     try { return readFileSync(this.path(id, kind, `${n}.jpg`)); } catch { return null; }
   }
 
-  private ids(): string[] {
+  ids(): string[] {
     try { return readdirSync(this.dir).filter((d) => /^g[0-9a-f]+$/.test(d)); } catch { return []; }
   }
 
