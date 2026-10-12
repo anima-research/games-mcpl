@@ -39,8 +39,9 @@ export function catalogue(wadDir: string | null): Catalogue {
     freedoom1: { title: 'Freedoom: Phase 1 (free Doom-compatible campaign, 4 episodes × 9 maps)', maps: E1 },
     freedoom2: { title: 'Freedoom: Phase 2 (free Doom II-compatible campaign, 32 maps)', maps: MAPS },
   };
-  if (wadDir && existsSync(join(wadDir, 'doom.wad'))) games.doom = { title: 'DOOM (1993)', maps: E1 };
-  if (wadDir && existsSync(join(wadDir, 'doom2.wad'))) games.doom2 = { title: 'DOOM II', maps: MAPS };
+  if (wadDir && existsSync(join(wadDir, 'doom.wad'))) games.doom = { title: 'The Ultimate DOOM (4 episodes × 9 maps)', maps: E1 };
+  if (wadDir && existsSync(join(wadDir, 'doom2.wad'))) games.doom2 = { title: 'DOOM II: Hell on Earth (32 maps)', maps: MAPS };
+  if (wadDir && existsSync(join(wadDir, 'heretic.wad'))) games.heretic = { title: 'Heretic: Shadow of the Serpent Riders (5 episodes × 9 maps; staff, elven wand, crossbow, dragon claw…; gargoyles, golems, undead warriors)', maps: Array.from({ length: 45 }, (_, i) => `E${Math.floor(i / 9) + 1}M${(i % 9) + 1}`) };
   return { games, skills: SKILLS };
 }
 
@@ -49,7 +50,7 @@ export function nextMap(game: string, map: string, cat: Catalogue): string | nul
   const i = maps.indexOf(map);
   if (i < 0) return null;
   // Doom episodes end on M8 (M9 is the secret level); Doom II runs straight through.
-  if (/^E\dM8$/.test(map)) { const e = Number(map[1]); return e < 4 ? `E${e + 1}M1` : null; }
+  if (/^E\dM8$/.test(map)) { const e = Number(map[1]); return maps.includes(`E${e + 1}M1`) ? `E${e + 1}M1` : null; }
   if (/^E\dM9$/.test(map)) return `E${map[1]}M2`;
   return maps[i + 1] ?? null;
 }

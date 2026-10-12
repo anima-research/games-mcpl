@@ -33,7 +33,7 @@ export const TOOLS = [
   { name: 'game_list', description: 'What you can play (games, maps, skills), who is playing right now, and your own game if any.', inputSchema: { type: 'object', properties: {} } },
   { name: 'game_start', description: 'Start a game (or restart on a new map after dying / finishing a level). Ends your previous game. Returns your first look at the level.',
     inputSchema: { type: 'object', properties: {
-      game: { type: 'string', description: 'freedoom1 (default; Doom-style E1M1…E4M9) or freedoom2 (Doom II-style MAP01…MAP32); doom/doom2 when their WADs are installed.' },
+      game: { type: 'string', description: 'freedoom1 (default; Doom-style E1M1…E4M9), freedoom2 (Doom II-style MAP01…MAP32), and when installed: doom (Ultimate Doom), doom2, heretic (E1M1…E5M9). game_list shows what is here.' },
       map: { type: 'string', description: 'Map name, e.g. E1M1 (default: the first map).' },
       skill: { type: 'number', description: '1 easiest … 5 Nightmare. Default 3.' },
       image: imageProp, image_scale: scaleProp,
