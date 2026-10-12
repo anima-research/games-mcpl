@@ -124,7 +124,7 @@ class Doom:
         self.notes = []       # HUD messages seen during the current act
 
     # ── lifecycle ──
-    def start(self, game="freedoom1", map=None, skill=3, width=320, height=240):
+    def start(self, game="freedoom1", map=None, skill=3, width=320, height=240, image="frame", image_scale=1.0):
         if game not in GAMES:
             raise ValueError(f"unknown game {game!r}; available: {', '.join(GAMES)}")
         maps = GAMES[game]["maps"]
@@ -177,7 +177,7 @@ class Doom:
         # turns and moves issued in tics 1-6 are dropped) — burn them here so the
         # agent's first action counts.
         self.g.make_action([0] * len(BUTTONS), 10)
-        return self.observe(events=[f"Started {game} {map} on skill {skill} ({SKILLS[skill]})."])
+        return self.observe(events=[f"Started {game} {map} on skill {skill} ({SKILLS[skill]})."], image=image, image_scale=float(image_scale))
 
     @staticmethod
     def _resolution(res):
@@ -407,7 +407,7 @@ class Doom:
     def _diff_events(self, a, b):
         ev = []
         if b["damage_taken"] > a["damage_taken"]:
-            ev.append(f"Took {int(b['damage_taken'] - a['damage_taken'])} damage (health {int(a['health'])} → {int(b['health'])}).")
+            ev.append(f"Took {int(b['damage_taken'] - a['damage_taken'])} damage; health {int(a['health'])} → {int(b['health'])}" + (" (healed by pickups meanwhile)." if b['health'] >= a['health'] else "."))
         if b["kills"] > a["kills"]:
             ev.append(f"Killed {int(b['kills'] - a['kills'])} enemy(ies).")
         if b["hits"] > a["hits"]:
@@ -523,8 +523,8 @@ class Doom:
             else:
                 o = self._find_object(int(tgt))
                 if o is None:
-                    events.append(f"face: object {tgt} not found (gone or never existed).")
-                    return f"face {tgt} (not found)", None
+                    events.append(f"face: object #{tgt} is no longer in the map (picked up, destroyed or never existed).")
+                    return f"face #{tgt} (gone)", None
                 b, d = self._bearing_to(o.position_x, o.position_y)
                 what = f"{MONSTER_NAMES.get(o.name, o.name)} #{o.id} ({int(d)} units)"
             return f"face {what}: turned {int(b)}°", self._turn(b, stop_on, watch)
@@ -537,8 +537,8 @@ class Doom:
             else:
                 o = self._find_object(int(tgt))
                 if o is None:
-                    events.append(f"goto: object {tgt} not found.")
-                    return f"goto {tgt} (not found)", None
+                    events.append(f"goto: object #{tgt} is no longer in the map (picked up, destroyed or never existed).")
+                    return f"goto #{tgt} (gone)", None
                 tx, ty, what = o.position_x, o.position_y, f"{MONSTER_NAMES.get(o.name, o.name)} #{o.id}"
             used = 0
             x0, y0 = self._pos()

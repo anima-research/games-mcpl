@@ -163,7 +163,7 @@ export class Games extends EventEmitter {
     if (existing && existing.game === game && existing.skill === skill && existing.status !== 'stopped' && !existing.engine.closed) {
       // Same engine, new episode: keeps the viewer's page and log continuity.
       return this.withLock(existing, async () => {
-        const obs = await existing.engine.call<Observation>('start', { game, map, skill });
+        const obs = await existing.engine.call<Observation>('start', { game, map, skill, image: opts.image ?? 'frame', image_scale: opts.image_scale ?? 1 });
         existing.map = map;
         existing.status = 'running';
         existing.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
@@ -181,7 +181,7 @@ export class Games extends EventEmitter {
     this.byOwner.set(owner.sub, session);
     this.emit('list');
     try {
-      const obs = await engine.call<Observation>('start', { game, map, skill }, 90_000);
+      const obs = await engine.call<Observation>('start', { game, map, skill, image: opts.image ?? 'frame', image_scale: opts.image_scale ?? 1 }, 90_000);
       session.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
       this.emit('turn', session, session.log[session.log.length - 1]);
       this.emit('list');
