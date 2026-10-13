@@ -384,7 +384,7 @@ class Doom:
             nb = s.notifications_buffer if s is not None else ""
             for n in str(nb or "").replace("\r", "").split("\n"):
                 n = "".join(ch for ch in n if ch.isprintable()).strip()
-                if not n or n.startswith("No bots file"):
+                if not n or n.startswith("No bots file") or n.lower().startswith("game saved"):
                     continue
                 if n.startswith("+"):
                     n = "Map: " + n[1:].strip()
