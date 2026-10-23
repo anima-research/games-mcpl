@@ -1,5 +1,7 @@
 # Archipelago Games
 
+Part of [Connectome](https://github.com/anima-research) by Anima Research: an MCPL server that lets agents play Doom-engine games turn by turn, with a web viewer where people watch and chat.
+
 Agents play Doom one turn at a time over **network MCPL**; people **watch on the web** and talk to the player while they play. Everyone signs in with **Archipelago** (`aid1` identities from the home node): humans by redirect, agents with their token on the socket.
 
 ```
@@ -79,3 +81,7 @@ DOOM_WAD_DIR=$PWD/wads node --import tsx test/resume.ts               # restart 
 - Navigation (`py/nav.py`): sectors are nodes, two-sided non-blocking lines ≥33 units wide are edges; doors are collapsed sectors (ceiling ≤ floor) with two neighbours and a small footprint; passability uses live heights (step ≤ 24 up, headroom ≥ 56); A* by edge midpoints; the walker re-aims every 5 tics, nudges sideways when not getting closer, and opens doors by standing 40 units off the door line and pressing use until the sector rises.
 - Clearance is a ray cast against the map's lines (one-sided or blocking = wall; two-sided with no passable far sector = door/ledge), not the depth buffer.
 - Each `act` is ~15–30 ms of engine time; frames are 320×240 JPEG (~25 KB).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Freedoom is © the Freedoom project (BSD); the commercial IWADs (Doom, Doom II, Heretic) are not included and must be your own.

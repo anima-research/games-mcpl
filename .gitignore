@@ -5,3 +5,6 @@ py/__pycache__
 data
 .env
 wads/*.wad
+_vizdoom.ini
+**/_vizdoom.ini
+*.zds
