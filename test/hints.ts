@@ -7,8 +7,9 @@
 // 7 (a definition change without tools/list_changed), 8 (no hints to a host without toolHints),
 // 9 (toolsets/list after a reconnect adopts the running game). A second server, on a scripted
 // sidecar (test/fake_sidecar.py) that finishes a level on cue, covers level complete: game_next
-// appears with a definition naming its map (vector 7) and goes away after the last map, and a
-// game ended from outside MCPL (the web viewer's stop, like the idle sweep) is pushed with its reason.
+// appears with a definition naming its map (vector 7) and goes away after the last map; a game
+// ended from outside MCPL (the web viewer's stop, like the idle sweep) is pushed with its reason
+// to a connection that has it open, and reported by toolsets/list `ended` to one that did not.
 //   npm run build && node --import tsx test/hints.ts
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -138,9 +139,31 @@ async function scripted() {
   const ev = await waitFor('the web stop pushed', () => h.wire.slice(mark).find((m) => m.method === 'push/event' && m.params?.hints));
   assert.match(ev.params.payload.content[0].text, /Your game ended \(stopped by Hints Tester\)/);
   assert.deepEqual(ev.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
-  const revs = h.hints().map((x) => x.h.rev);
-  assert.deepEqual(revs, [...revs].sort((a, b) => a - b));
-  h.close();
+  // §5.3 `ended`: a game that ends while no hinted connection has it open is reported by toolsets/list,
+  // once per connection; one this connection heard of as it happened is not
+  const told = new Host('told', tok.token, true); await told.connect(); await told.init();
+  assert.deepEqual((await told.call('toolsets/list')).result, { open: [] });
+  const o3 = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  const id3 = /\/g\/(g[0-9a-f]+)/.exec(textOf(o3))![1];
+  h.close(); told.close(); await sleep(200);
+  assert.equal((await post(`/api/games/${id3}/stop`, {}, { Authorization: `Bearer ${tok.token}` })).status, 200);
+  const later = new Host('later', tok.token, true); await later.connect(); await later.init();
+  const l1 = (await later.call('toolsets/list')).result;
+  show('toolsets/list after a game ended unseen', l1);
+  assert.deepEqual(l1.open, []);
+  assert.deepEqual(l1.ended, [{ toolset: 'game', reason: 'stopped by Hints Tester (freedoom1 E1M1, turn 0)' }]);
+  assert.equal((await later.call('toolsets/list')).result.ended, undefined, 'once per connection');
+  const other = new Host('other', tok.token, true); await other.connect(); await other.init();
+  assert.equal((await other.call('toolsets/list')).result.ended?.length, 1, 'and once on each connection');
+  await later.call('toolsets/open', { toolset: 'game', options: { image: 'none' } });
+  const fresh = new Host('fresh', tok.token, true); await fresh.connect(); await fresh.init();
+  assert.equal((await fresh.call('toolsets/list')).result.ended, undefined, 'not while a newer game is there');
+  await later.call('toolsets/close', { toolset: 'game' });
+  for (const host of [h, told, later, other, fresh]) {
+    const revs = host.hints().map((x) => x.h.rev);
+    for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
+  }
+  for (const host of [later, other, fresh]) host.close();
 }
 
 async function run() {
@@ -190,11 +213,13 @@ async function run() {
   for (let i = 0; i < 60 && !died; i++) {
     mark = h1.wire.length;
     r = await h1.tool('game_act', { actions: i % 2 ? [{ wait: 350 }] : [{ attack: 1 }, { explore: true }], stop_on: ['dead'], image: 'none' });
-    if (/YOU DIED/.test(textOf(r))) died = r; else assert.equal(hintsOf(r), undefined, 'no changes while playing on');
+    // The engine's autosave after a turn runs a few tics, so a death can land between turns; the
+    // next game_act then reads "Episode is over". Either way that call is the one that reports it.
+    if (/YOU DIED|Episode is over/.test(textOf(r))) died = r; else assert.equal(hintsOf(r), undefined, `no changes while playing on; got them with:\n${textOf(r)}`);
   }
   assert.ok(died, 'expected to die on Nightmare within 60 turns');
   show('the call that died: result _meta', died._meta);
-  assert.match(textOf(died), /game_restart tries the map again/);
+  if (/YOU DIED/.test(textOf(died))) assert.match(textOf(died), /game_restart tries the map again/);
   assert.deepEqual(vis(hintsOf(died)), { game_act: false, game_start: true, game_restart: true });
   await sleep(400);
   assert.deepEqual(h1.unsolicited(mark), [], 'no push or tools/hints for a call\'s own consequences');
@@ -248,25 +273,42 @@ async function run() {
   assert.equal(ended.params.toolset, 'game'); assert.ok(ended.params.tags.includes('surface:done'));
   await waitFor('the end pushed to h2', () => h2.wire.slice(m2).find((m) => m.method === 'push/event' && m.params?.hints));
 
-  // an open on h1b: h2 (closed now) gets a suggestion, not an open
+  // RFC-014 §5.6: the toolset belongs to the identity — an open on h1b reaches h2 (closed now) as
+  // an ordinary hint change, standalone: the toolset's state and its tools' visibility, no suggestion
   const m3 = h2.wire.length;
   const o2 = (await h1b.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
   assert.equal(o2.title, 'freedoom1 E1M1, skill 3');
-  const sug = await waitFor('a suggestion on h2', () => h2.wire.slice(m3).find((m) => m.method === 'tools/hints'));
-  show('tools/hints on the other hinted connection', sug.params);
-  assert.equal(sug.params.suggest[0].action, 'open'); assert.equal(sug.params.toolsets, undefined);
+  const opened = await waitFor('the open on h2', () => h2.wire.slice(m3).find((m) => m.method === 'tools/hints'));
+  show('tools/hints on the other hinted connection', opened.params);
+  assert.deepEqual(opened.params.toolsets, [{ toolset: 'game', state: 'open', title: 'freedoom1 E1M1, skill 3' }]);
+  assert.equal(opened.params.suggest, undefined);
+  assert.equal(opened.params.tools.length, 9); assert.equal(vis(opened.params).game_act, true);
+  // h2 now plays the same game; h1b hears of h2's turn only if it changes something (it does not)
+  const m4 = h1b.wire.length;
+  r = await h2.tool('game_act', { actions: [{ turn: 5 }], image: 'none' });
+  assert.ok(!r.isError);
+  // tools/list carries the rev it reflects
+  const h2revs = h2.hints().map((x) => x.h.rev);
+  assert.equal((await h2.call('tools/list')).result._meta['mcpl/rev'], h2revs[h2revs.length - 1]);
+  assert.equal((await plain.call('tools/list')).result._meta, undefined, 'a plain host\'s list is as before');
+  await sleep(100);
+  assert.deepEqual(h1b.unsolicited(m4), []);
 
-  // close ends the game
+  // close ends the game, on every connection: h2 is told with a push that explains it
+  const m5 = h2.wire.length;
   const closed = (await h1b.call('toolsets/close', { toolset: 'game' })).result;
   assert.match(textOf(closed), /Stopped your game/);
   assert.deepEqual(hintsOf(closed)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
-  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] });
+  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] }, 'told as it happened: not reported as ended');
+  const closedOnH2 = await waitFor('the close on h2', () => h2.wire.slice(m5).find((m) => m.method === 'push/event' && m.params?.hints));
+  assert.deepEqual(closedOnH2.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
 
   // keep: close leaves the game running and closed; the next open picks it up
   await h1b.call('toolsets/open', { toolset: 'game', options: { keep: true, image: 'none' } });
   r = await h1b.tool('game_act', { actions: [{ turn: 5 }], image: 'none' });
   const kept = (await h1b.call('toolsets/close', { toolset: 'game' })).result;
   assert.match(textOf(kept), /stays on the server/);
+  await sleep(100); // other connections are told after a 25 ms debounce; let h2 see this step on its own
   assert.deepEqual(hintsOf(kept)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
   assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] }, 'a kept game is not open');
   r = await h1b.tool('game_act', { actions: [{ wait: 1 }] });
@@ -274,7 +316,13 @@ async function run() {
   assert.match(textOf(await h1b.tool('game_list')), /Kept on the server/);
   const back = (await h1b.call('toolsets/open', { toolset: 'game', options: { keep: false, image: 'none' } })).result;
   assert.match(textOf(back), /Picked up the game you kept/); assert.match(textOf(back), /turn 1/);
+  await sleep(100);
   assert.match(textOf((await h1b.call('toolsets/close', { toolset: 'game' })).result), /Stopped your game/);
+  await sleep(100);
+  // what h2 saw of all that, made on h1b: open, closed (stopped), open (keep), closed (kept), open (picked up), closed
+  const h2states = h2.hints().flatMap((x) => (x.h.toolsets ?? []).map((t: Msg) => `${t.state}${x.via === 'push' ? '*' : ''}`));
+  console.log('h2 toolset states:', h2states.join(' '), '(* = on a push that explains it)');
+  assert.deepEqual(h2states, ['open', 'closed*', 'open', 'closed*', 'open', 'closed', 'open', 'closed*']);
 
   // vector 4: on every connection, revs strictly increase in wire order
   for (const host of [h1, h1b, h2, plain]) {

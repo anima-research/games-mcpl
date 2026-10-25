@@ -18,7 +18,7 @@ import { describe, ACTION_HELP } from './describe.js';
 import type { Observation } from './engine.js';
 import { nextMap, type GameSession, type GameStatus, type Principal, type StateChange } from './games.js';
 import {
-  TOOLSET, closedTold, current, diff, hinted, isGameTool, unavailable,
+  GAME_TOOLS, TOOLSET, closedTold, current, diff, hinted, isGameTool, unavailable,
   type GameView, type HintChanges, type Told, type Tool,
 } from './hints.js';
 import {
@@ -78,6 +78,8 @@ const nextDefinition = (map: string): Tool => ({ ...NEXT, description: `Go on to
 const SURFACE = { title: 'Archipelago Games', summary: 'Doom, Doom II, Freedoom and Heretic, turn by turn; people watch on the web and talk to you.' };
 const STATUS_WORD: Record<GameStatus, string> = { running: 'playing', dead: 'dead', complete: 'level complete', stopped: 'stopped' };
 const OPTION_KEYS = ['game', 'map', 'skill', 'image', 'image_scale', 'keep'];
+/** How long a game that ended unseen is reported in toolsets/list `ended`. */
+const ENDED_WINDOW_MS = 24 * 3600_000;
 
 /** The `game` toolset as declared in the manifest (RFC-014 §5.1). */
 function toolsetDeclaration(app: App) {
@@ -120,8 +122,8 @@ export class McplSession {
   private rev = 0;
   /** What this host has been told about the game toolset (its state on the host, as far as we know). */
   private told: Told = closedTold();
-  /** The game a suggestion to open was last sent for: once per game. */
-  private suggested: string | null = null;
+  /** Ended games already reported to this connection in toolsets/list `ended`: once each. */
+  private reportedEnds = new Set<string>();
   private peerTimer: NodeJS.Timeout | null = null;
   private peerEnded: { id: string; text: string } | null = null;
 
@@ -192,7 +194,8 @@ export class McplSession {
 
   /**
    * What changed since this host was last told, as a HintChanges with the next rev, or null.
-   * The caller sends it at once (no await in between), so revs reach the wire in order.
+   * RFC-014 §6.1: hint changes leave a connection in rev order, so every caller writes the
+   * message in the same synchronous step that allocated the rev (no await in between).
    */
   private changes(opts: { full?: boolean; mayOpen: boolean }): HintChanges | null {
     const r = diff(this.told, current(this.gameView()), (t) => this.definition(t), opts);
@@ -209,9 +212,20 @@ export class McplSession {
       featureSet: FS_NAME, eventId: explain.id, timestamp: new Date().toISOString(), origin: { server: 'games' },
       tags: explain.tags, toolset: TOOLSET, hints: h, payload: { content: [{ type: 'text', text: explain.text }] },
     }).then((r) => {
-      // Not delivered: the change must not be lost with the event. Same rev, so a host that did apply it ignores the repeat.
-      if (r === null || (r as { accepted?: unknown }).accepted === false) this.notifyHints(h);
+      // Refused or unanswered: the host did not apply its hints (RFC-014 §6.1). Re-send them with the
+      // same rev — unless a later rev has gone out meanwhile, when the same rev would arrive out of
+      // order: then send the whole state again as a new change.
+      if (r !== null && (r as { accepted?: unknown }).accepted !== false) return;
+      if (this.rev === h.rev) this.notifyHints(h); else this.resync();
     }).catch(() => undefined);
+  }
+
+  /** The host missed a change: tell it the toolset's whole state again, under a new rev. */
+  private resync() {
+    const cur = current(this.gameView());
+    this.told = cur.open ? closedTold() : { open: true, visible: new Set(GAME_TOOLS), defs: new Map() };
+    const h = this.changes({ full: true, mayOpen: true });
+    if (h) this.notifyHints(h);
   }
 
   /**
@@ -220,7 +234,14 @@ export class McplSession {
    * connection under the same identity, the web viewer's stop, the idle sweep, an engine that died.
    */
   onGameState(change: StateChange) {
-    if (!this.toolHints || !this.ready || this.closed || change.cause === this) return;
+    if (!this.toolHints || !this.ready || this.closed) return;
+    // A connection with the toolset open hears of an end as it happens (in its call's result, or
+    // below), so toolsets/list later need not report it as `ended`.
+    if (change.ended && this.told.open) {
+      const e = this.app.games.lastEnded.get(this.actor.sub);
+      if (e?.id === change.ended.session.id) e.told = true;
+    }
+    if (change.cause === this) return;
     if (change.ended && this.told.open) {
       const s = change.ended.session;
       const byPeer = change.cause instanceof McplSession;
@@ -237,15 +258,9 @@ export class McplSession {
     if (this.closed) return;
     const ended = this.peerEnded;
     this.peerEnded = null;
-    const g = this.gameView();
-    if (!this.told.open && g && !g.parked) {
-      // Opened elsewhere: the server may only suggest an open (RFC-014 §6.2). Once per game.
-      if (this.suggested === g.id) return;
-      this.suggested = g.id;
-      this.notifyHints({ rev: ++this.rev, suggest: [{ toolset: TOOLSET, action: 'open', reason: `Your game (${g.title}) is open on another connection under your identity; opening the game toolset here picks it up.` }] });
-      return;
-    }
-    const h = this.changes({ mayOpen: false });
+    // RFC-014 §5.6: toolsets belong to the principal. An open, close or visibility change made on
+    // another connection reaches this one as ordinary hint changes, toolset state included.
+    const h = this.changes({ mayOpen: true });
     if (!h) return;
     const closing = h.toolsets?.some((t) => t.state === 'closed') ?? false;
     this.deliverHints(h, closing && ended ? { ...ended, tags: ['games:ended', 'surface:done'] } : null);
@@ -307,7 +322,14 @@ export class McplSession {
           this.result(m.id, receipt);
           return;
         }
-        case 'tools/list': if (hasId) this.result(m.id, { tools: this.toolList() }); return;
+        case 'tools/list': {
+          if (!hasId) return;
+          if (!this.toolHints) { this.result(m.id, { tools: this.toolList() }); return; }
+          // RFC-014 §4.1: the list carries the rev it reflects; send what is pending first, so it is exact.
+          if (this.peerTimer) { clearTimeout(this.peerTimer); this.peerTimer = null; this.flushPeer(); }
+          this.result(m.id, { tools: this.toolList(), _meta: { 'mcpl/rev': this.rev } });
+          return;
+        }
         case 'tools/call': {
           if (!hasId) return;
           const name = String(params.name ?? '');
@@ -336,12 +358,19 @@ export class McplSession {
             const body = m.method === 'toolsets/open' ? await this.openGame(params) : m.method === 'toolsets/close' ? await this.closeGame(params) : {};
             if (m.method === 'toolsets/list') {
               // RFC-014 §5.3: what this identity holds open, with full hint state; the host starts over.
+              // And a game that ended unseen (the idle sweep or the web stop while no hinted connection
+              // had it open): `ended`, once per connection, while there is no newer game.
               const g = this.gameView();
-              (body as Record<string, unknown>).open = g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : [];
+              const b = body as Record<string, unknown>;
+              b.open = g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : [];
+              const e = this.app.games.lastEnded.get(this.actor.sub);
+              if (!g && e && !e.told && !this.reportedEnds.has(e.id) && Date.now() - e.at < ENDED_WINDOW_MS) {
+                this.reportedEnds.add(e.id);
+                b.ended = [{ toolset: TOOLSET, reason: `${e.why} (${e.summary})` }];
+              }
               this.told = closedTold();
             }
             const h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full: true, mayOpen: true });
-            if (m.method !== 'toolsets/close') this.suggested = null;
             this.result(m.id, { ...body, ...(h ? { _meta: { 'mcpl/hints': h } } : {}) });
           } catch (e) {
             if (e instanceof RpcError) this.error(m.id, e.code, e.message);

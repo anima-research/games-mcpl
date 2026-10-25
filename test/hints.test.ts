@@ -72,7 +72,7 @@ test('a close reports what was visible as invisible, and the toolset closed', ()
   assert.equal(current(view('running', { parked: true })).open, false);
 });
 
-test('a toolset opened elsewhere is not reported as open unless this exchange may open it', () => {
+test('an open is reported only by an exchange that may report it (not a static tool\'s result)', () => {
   const r = diff(closedTold(), current(view('running')), define, { mayOpen: false });
   assert.equal(r.changes, null);
   assert.equal(r.told.open, false);

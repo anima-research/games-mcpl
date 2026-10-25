@@ -147,6 +147,12 @@ export class Games extends EventEmitter {
   /** Finished games kept for the lobby. */
   readonly recent: PublicGame[] = [];
   private byOwner = new Map<string, GameSession>();
+  /**
+   * Each player's last ended game, for MCPL toolsets/list `ended` (RFC-014 §5.3). `told`: a hinted
+   * connection that had the toolset open heard of the end as it happened, so it is not news later.
+   * In memory only: after a restart there is nothing to report.
+   */
+  readonly lastEnded = new Map<string, { id: string; why: string; summary: string; at: number; told: boolean }>();
   readonly catalogue: Catalogue;
   readonly recordings: Recordings;
   private sweeper: NodeJS.Timeout;
@@ -347,6 +353,7 @@ export class Games extends EventEmitter {
     this.recent.splice(30);
     try { appendFileSync(join(this.config.dataDir, 'results.jsonl'), JSON.stringify({ ...pub, why }) + '\n'); } catch (e) { this.log(`results write failed: ${(e as Error).message}`); }
     this.log(`${session.owner.name}'s game ${session.id} ended: ${session.status} (${why})`);
+    this.lastEnded.set(session.owner.sub, { id: session.id, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt, told: false });
     this.emit('ended', session);
     this.emit('list');
     this.emit('state', session.owner.sub, { cause, ended: { session, why } } satisfies StateChange);

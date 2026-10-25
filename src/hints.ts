@@ -90,9 +90,9 @@ export function current(g: GameView | null): Told {
 /**
  * The changes that take a host from `told` to `cur`, and what it has been told afterwards.
  * - `full`: report every toolset tool, visible or not (an open or a list: the host starts over).
- * - `mayOpen`: this exchange may report the toolset opening (the host opened it, listed it, or
- *   called one of its tools). Otherwise a toolset that opened elsewhere is left to a suggestion
- *   (RFC §6.2: the server only suggests opens) and `told` stays closed.
+ * - `mayOpen`: this exchange may report the toolset opening — an open, a list, a call of one of
+ *   its tools, or a change made on another connection of the principal (RFC §5.6). A static
+ *   tool's result does not, so an open made elsewhere goes out on its own, not in that result.
  * A close reports the tools that were visible as invisible, and the toolset closed.
  */
 export function diff(told: Told, cur: Told, define: (tool: string) => Tool, opts: { full?: boolean; mayOpen: boolean }): { changes: Changes | null; told: Told } {
