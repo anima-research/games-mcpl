@@ -329,6 +329,10 @@ async function main() {
     show('toolsets/list on a later connection after a go_cancel', l3.ended);
     const rec = { id: `go-${wcode}-w`, toolset: 'go', instance: 'w', reason: `withdrawn with go_cancel before anyone joined (${wcode})` };
     assert.deepEqual(l3.ended, [rec]);
+    // r6 §5.3: with nothing open, toolsets/list is still a statement under its own rev
+    const dee = new Host('dee', await token('Hints Dee')); await dee.connect(); await dee.init();
+    assert.deepEqual((await dee.call('toolsets/list')).result, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } });
+    dee.close();
     assert.deepEqual((await ada3.call('toolsets/list')).result.ended, [rec], 'every list, the same id');
     assert.deepEqual((await ada2.call('toolsets/list')).result.ended, [rec], 'and on the connection that caused it');
     ada3.close();
