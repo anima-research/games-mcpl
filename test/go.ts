@@ -8,7 +8,8 @@
 //     an opponent offline whose events wait for their next toolsets/list; a forfeit on close;
 //   - reconnect and server restart: toolsets/list reports the instance, the game goes on;
 //   - a host without toolHints never sees Go.
-// RFC-014 §13 vectors: 1, 2, 4, 5, 6, 9, 14, 16, 17, 18, 19.
+// RFC-014 §13 vectors: 1, 2, 4, 5, 6, 9, 14, 16, 17, 18, 19; and r4's consecutive revs (every
+// host here asserts rev = last + 1 on every message) and full toolsets/list statements.
 //   npm run build && node --import tsx test/go.ts
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -42,6 +43,8 @@ class Host {
   /** The host's own view of per-instance visibility, built from hints in rev order. */
   vis = new Map<string, Set<string>>();
   lastRev = 0;
+  /** Ids of toolsets/list requests: their results are full statements that replace the per-instance state. */
+  private lists = new Set<number>();
   constructor(readonly label: string, private tok: string, private toolHints = true) {}
   connect() {
     return new Promise<void>((res, rej) => {
@@ -51,6 +54,7 @@ class Host {
         const m = JSON.parse(d.toString());
         this.wire.push(m);
         const h = m.result?._meta?.['mcpl/hints'] ?? (m.method === 'push/event' ? m.params?.hints : m.method === 'tools/hints' ? m.params : undefined);
+        if (this.lists.delete(m.id)) this.vis.clear(); // RFC-014 r4 §5.3: a list replaces the per-instance state
         if (h) this.apply(h);
         if (m.method === 'push/event') { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { accepted: true } })); return; }
         const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); p(m); }
@@ -58,7 +62,8 @@ class Host {
     });
   }
   private apply(h: Msg) {
-    assert.ok(h.rev > this.lastRev, `${this.label}: rev ${h.rev} after ${this.lastRev}`);
+    // RFC-014 r4 §6.1: revs on a connection are consecutive across results, pushes and tools/hints
+    assert.equal(h.rev, this.lastRev + 1, `${this.label}: rev ${h.rev} after ${this.lastRev}`);
     this.lastRev = h.rev;
     for (const t of h.tools ?? []) {
       if (!t.name.startsWith('go_')) continue;
@@ -70,7 +75,11 @@ class Host {
     for (const ts of h.toolsets ?? []) if (ts.toolset === 'go' && ts.state === 'closed') this.vis.delete(ts.instance);
   }
   visible(instance: string) { return [...(this.vis.get(instance) ?? [])].sort(); }
-  call(method: string, params: unknown = {}) { const id = this.id++; return new Promise<Msg>((res) => { this.pending.set(id, res); this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }); }
+  call(method: string, params: unknown = {}) {
+    const id = this.id++;
+    if (method === 'toolsets/list') this.lists.add(id);
+    return new Promise<Msg>((res) => { this.pending.set(id, res); this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); });
+  }
   async init() {
     const r = await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', ...(this.toolHints ? { toolHints: true } : {}) } } }, clientInfo: { name: `go-${this.label}`, version: '0' } });
     this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
@@ -106,6 +115,15 @@ async function botGame(ada: Host) {
   const second = await ada.open({ level: 'easy' });
   assert.equal(second.instance, 'go-1');
   assert.equal((await ada.call('toolsets/open', { toolset: 'go', instance: 'no spaces' })).error?.code, -32602, 'an invalid name is refused, never replaced');
+  // RFC-014 r4 §5.3: toolsets/list is a full statement — every tool visible in each open instance
+  // (anything not stated visible is invisible), each entry naming its instance
+  const full = (await ada.call('toolsets/list')).result;
+  assert.deepEqual(full.open.map((o: Msg) => o.instance), ['first', 'go-1']);
+  const stated = (inst: string) => hintsOf(full)!.tools.filter((t: Msg) => t.instance === inst && t.visible).map((t: Msg) => t.name).sort();
+  assert.deepEqual(stated('first'), ['go_pass', 'go_play', 'go_resign', 'go_undo']);
+  assert.deepEqual(stated('go-1'), ['go_pass', 'go_play', 'go_resign', 'go_undo']);
+  assert.ok(hintsOf(full)!.tools.every((t: Msg) => t.instance === 'first' || t.instance === 'go-1'));
+  assert.deepEqual(hintsOf(full)!.toolsets.map((t: Msg) => `${t.instance}:${t.state}`).sort(), ['first:open', 'go-1:open']);
   // vector 6: two open and no mcpl/instance
   const ambiguous = await ada.tool('go_play', { point: 'E5' });
   assert.ok(ambiguous.isError && /first, go-1/.test(textOf(ambiguous)));

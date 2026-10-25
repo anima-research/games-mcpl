@@ -136,7 +136,7 @@ export function unitOf(key: string): { toolset: string; instance?: string } {
 
 /**
  * diffUnit over every unit the host was told of or that is open now. `full`: true for all units,
- * or the keys to restate in full (an open restates the unit it opened).
+ * or the keys to state in full (an open states the unit it opened in full).
  */
 export function diffUnits(told: Units, cur: Units, toolsOf: (toolset: string) => readonly string[], define: (key: string, tool: string) => Tool,
   opts: { full?: boolean | ReadonlySet<string>; mayOpen: boolean }): { changes: Changes | null; told: Units } {
