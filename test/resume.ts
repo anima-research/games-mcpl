@@ -1,6 +1,7 @@
 // Restart survival: start a dev server, play two turns over /mcpl, SIGTERM the
 // server, start it again, and check the same game is back (same id, running,
-// history intact) and the player can simply continue.
+// history intact) and the player can simply continue — and that a host advertising MCPL
+// RFC-014 toolHints adopts the resumed game through toolsets/list.
 //   node --import tsx test/resume.ts
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -32,10 +33,10 @@ const j = async (method: string, path: string, body?: unknown, headers: Record<s
 
 class Client {
   ws!: WebSocket; id = 1; pending = new Map<number, (v: any) => void>();
-  constructor(private token: string) {}
+  constructor(private token: string, private toolHints = false) {}
   connect() { return new Promise<void>((res, rej) => { this.ws = new WebSocket(`${base.replace('http', 'ws')}/mcpl?token=${encodeURIComponent(this.token)}`); this.ws.on('open', () => res()); this.ws.on('error', rej); this.ws.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.method === 'push/event') { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { accepted: true } })); return; } const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); p(m); } }); }); }
   call(method: string, params: unknown = {}) { const id = this.id++; return new Promise<any>((res) => { this.pending.set(id, res); this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }); }
-  async init() { await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5' } } }, clientInfo: { name: 'resume', version: '0' } }); this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })); await this.call('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabledFeatureSets: ['*'] }); }
+  async init() { await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', ...(this.toolHints ? { toolHints: true } : {}) } } }, clientInfo: { name: 'resume', version: '0' } }); this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })); await this.call('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabledFeatureSets: ['*'] }); }
   async tool(name: string, args: unknown = {}) { const r = await this.call('tools/call', { name, arguments: args }); if (r.error) throw new Error(`${name}: ${r.error.message}`); return r.result.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n') as string; }
 }
 
@@ -77,6 +78,11 @@ async function main() {
   t = await c.tool('game_act', { actions: [{ explore: true }], image: 'none' });
   assert.equal(Number(/turn (\d+)/.exec(t)![1]), turn1 + 1, 'turn numbering continues');
   console.log('continued:', /Did: [^\n]*/.exec(t)![0].slice(0, 100));
+  const h = new Client(tok.token, true); await h.connect(); await h.init();
+  const ls = (await h.call('toolsets/list')).result;
+  assert.deepEqual(ls.open, [{ toolset: 'game', title: 'doom E1M1, skill 2' }], 'a hinted host adopts the resumed game');
+  console.log('toolsets/list after the restart:', JSON.stringify(ls.open));
+  h.ws.close();
   await c.tool('game_stop');
   c.ws.close();
   await stopServer(server);

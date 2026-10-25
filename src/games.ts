@@ -74,6 +74,10 @@ export class GameSession {
   private chatId = 1;
   /** Serializes the player's own calls so two hosts can't interleave turns. */
   busy = false;
+  /** MCPL RFC-014: closing the game toolset leaves this game running (the `keep` open option). */
+  keep = false;
+  /** Closed with `keep`: still running, but its toolset stays closed until it is opened again. */
+  parked = false;
 
   constructor(readonly owner: Principal, readonly game: string, public map: string, readonly skill: number, readonly engine: Engine, id?: string, createdAt?: number) {
     this.id = id ?? `g${randomBytes(4).toString('hex')}`;
@@ -128,13 +132,36 @@ export class GameSession {
 export interface ActOptions { say?: string; stop_on?: string[]; image?: string; image_scale?: number }
 
 /**
- * Events: 'list' (lobby changed) · 'turn' (session, record) · 'chat' (session, msg) · 'ended' (session).
+ * A change to what a player's game is (started, a new episode, died, finished, ended), for the
+ * MCPL hints. `cause` is whatever the caller passed in (an MCPL connection), so the connection
+ * whose call caused it can report it in that call's result and the others are told separately.
+ */
+export interface StateChange { cause?: unknown; started?: GameSession; ended?: { session: GameSession; why: string } }
+
+/**
+ * Events: 'list' (lobby changed) · 'turn' (session, record) · 'chat' (session, msg) · 'ended' (session) ·
+ * 'state' (owner sub, StateChange).
  */
 export class Games extends EventEmitter {
   readonly sessions = new Map<string, GameSession>();
   /** Finished games kept for the lobby. */
   readonly recent: PublicGame[] = [];
   private byOwner = new Map<string, GameSession>();
+  /**
+   * Each player's ended games, for MCPL toolsets/list `ended` (RFC-014 §5.3): every end the host did
+   * not ask for with toolsets/close — the player's own game_stop, the web viewer's stop, the idle
+   * sweep, an engine that died — whoever was connected. In memory only: after a restart there is
+   * nothing to report.
+   */
+  readonly ended = new Map<string, Array<{ id: string; why: string; summary: string; at: number }>>();
+
+  /** A player's `ended` records from the last `withinMs` (older ones are dropped). */
+  endedRecords(sub: string, withinMs: number) {
+    const keep = (this.ended.get(sub) ?? []).filter((e) => e.at > Date.now() - withinMs);
+    if (keep.length) this.ended.set(sub, keep); else this.ended.delete(sub);
+    return keep;
+  }
+
   readonly catalogue: Catalogue;
   readonly recordings: Recordings;
   private sweeper: NodeJS.Timeout;
@@ -161,7 +188,7 @@ export class Games extends EventEmitter {
 
   // ---------------------------------------------------------------- play
 
-  async start(owner: Principal, opts: { game?: string; map?: string; skill?: number; image?: string; image_scale?: number }): Promise<{ session: GameSession; obs: Observation }> {
+  async start(owner: Principal, opts: { game?: string; map?: string; skill?: number; image?: string; image_scale?: number }, cause?: unknown): Promise<{ session: GameSession; obs: Observation }> {
     const game = (opts.game ?? 'freedoom1').toLowerCase();
     const entry = this.catalogue.games[game];
     if (!entry) throw new Fault(400, `Unknown game "${game}". Available: ${Object.keys(this.catalogue.games).join(', ')}.`);
@@ -179,17 +206,19 @@ export class Games extends EventEmitter {
         existing.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
         this.emit('turn', existing, existing.log[existing.log.length - 1]);
         this.emit('list');
+        this.emit('state', owner.sub, { cause, started: existing } satisfies StateChange);
         await this.autosave(existing);
         return { session: existing, obs };
       });
     }
-    if (existing) await this.end(existing, 'stopped', 'replaced by a new game');
+    if (existing) await this.end(existing, 'stopped', 'replaced by a new game', cause, false);
     if (this.sessions.size >= this.config.maxGames) throw new Fault(503, `All ${this.config.maxGames} game slots are busy right now; try again in a little while.`);
 
     const id = `g${randomBytes(4).toString('hex')}`;
     const cwd = this.recordings.prepare(id);
     const engine = new Engine(this.config.python, this.config.sidecar, { ...(this.config.wadDir ? { DOOM_WAD_DIR: this.config.wadDir } : {}) }, (m) => this.log(`[${owner.name}] ${m}`), cwd);
     const session = new GameSession(owner, game, map, skill, engine, id);
+    session.keep = existing?.keep ?? false;
     this.sessions.set(session.id, session);
     this.byOwner.set(owner.sub, session);
     this.emit('list');
@@ -198,29 +227,32 @@ export class Games extends EventEmitter {
       session.record(obs, [{ start: `${game} ${map} skill ${skill}` }], undefined, 'system');
       this.emit('turn', session, session.log[session.log.length - 1]);
       this.emit('list');
+      this.emit('state', owner.sub, { cause, started: session } satisfies StateChange);
       await this.autosave(session);
       this.log(`${owner.name} started ${game} ${map} (skill ${skill}) as ${session.id}`);
       return { session, obs };
     } catch (e) {
-      await this.end(session, 'stopped', `engine failed: ${(e as Error).message}`);
+      await this.end(session, 'stopped', `engine failed: ${(e as Error).message}`, cause);
       throw e instanceof Fault ? e : new Fault(500, `The game engine could not start: ${(e as Error).message}`);
     }
   }
 
-  async act(owner: Principal, actions: unknown[], opts: ActOptions): Promise<{ session: GameSession; obs: Observation }> {
-    const session = this.requireMine(owner);
+  async act(owner: Principal, actions: unknown[], opts: ActOptions, cause?: unknown): Promise<{ session: GameSession; obs: Observation }> {
+    const session = this.requireMine(owner, cause);
     return this.withLock(session, async () => {
       const obs = await session.engine.call<Observation>('act', { actions, stop_on: opts.stop_on, image: opts.image ?? 'frame', image_scale: opts.image_scale ?? 1 });
+      const before = session.status;
       const rec = session.record(obs, actions, opts.say);
       this.emit('turn', session, rec);
       this.emit('list');
+      if (session.status !== before) this.emit('state', owner.sub, { cause } satisfies StateChange);
       await this.autosave(session);
       return { session, obs };
     });
   }
 
-  async look(owner: Principal, image = 'frame', image_scale = 1): Promise<{ session: GameSession; obs: Observation }> {
-    const session = this.requireMine(owner);
+  async look(owner: Principal, image = 'frame', image_scale = 1, cause?: unknown): Promise<{ session: GameSession; obs: Observation }> {
+    const session = this.requireMine(owner, cause);
     return this.withLock(session, async () => {
       const obs = await session.engine.call<Observation>('look', { image, image_scale });
       session.lastActiveAt = Date.now();
@@ -231,8 +263,8 @@ export class Games extends EventEmitter {
     });
   }
 
-  say(owner: Principal, text: string): GameSession {
-    const session = this.requireMine(owner);
+  say(owner: Principal, text: string, cause?: unknown): GameSession {
+    const session = this.requireMine(owner, cause);
     session.lastSay = text;
     session.lastActiveAt = Date.now();
     const rec: TurnRecord = { n: session.turn, at: Date.now(), by: 'agent', actions: [], say: text, events: [], status: session.last?.status ?? {} };
@@ -242,11 +274,21 @@ export class Games extends EventEmitter {
     return session;
   }
 
-  async stop(owner: Principal): Promise<GameSession | null> {
+  /** End the player's game. `byClose`: the MCPL host closed its toolset, an end it asked for (not an `ended` record). */
+  async stop(owner: Principal, cause?: unknown, byClose = false): Promise<GameSession | null> {
     const session = this.byOwner.get(owner.sub);
     if (!session) return null;
-    await this.end(session, 'stopped', 'stopped by the player');
+    await this.end(session, 'stopped', byClose ? 'the game toolset was closed' : 'stopped by the player', cause, !byClose);
     return session;
+  }
+
+  /** Toolset flags (MCPL RFC-014) — kept in state.json so they survive a restart like the game. */
+  setToolset(session: GameSession, flags: { keep?: boolean; parked?: boolean }, cause?: unknown) {
+    const was = session.parked;
+    if (flags.keep !== undefined) session.keep = flags.keep;
+    if (flags.parked !== undefined) session.parked = flags.parked;
+    if (this.sessions.has(session.id)) this.recordings.writeState(session.id, { ...(this.recordings.readState(session.id) ?? {}), ...this.stateOf(session) });
+    if (session.parked !== was) this.emit('state', session.owner.sub, { cause } satisfies StateChange);
   }
 
   chat(session: GameSession, from: ChatMessage['from'], text: string): ChatMessage {
@@ -267,7 +309,7 @@ export class Games extends EventEmitter {
   }
 
   private stateOf(session: GameSession) {
-    return { id: session.id, owner: session.owner, game: session.game, map: session.map, skill: session.skill, createdAt: session.createdAt, turn: session.turn, lastSay: session.lastSay ?? null, status: session.status };
+    return { id: session.id, owner: session.owner, game: session.game, map: session.map, skill: session.skill, createdAt: session.createdAt, turn: session.turn, lastSay: session.lastSay ?? null, status: session.status, keep: session.keep, parked: session.parked };
   }
 
   /** Bring back the games that were running when the server last stopped. */
@@ -280,6 +322,8 @@ export class Games extends EventEmitter {
       const session = new GameSession(owner, st.game, st.map, st.skill, engine, id, st.createdAt);
       session.turn = st.turn ?? 0;
       session.lastSay = st.lastSay ?? undefined;
+      session.keep = st.keep === true;
+      session.parked = st.parked === true;
       // replay the recorded log and chat so watchers and the player see history
       for (const e of this.recordings.events(id) as any[]) {
         if (e?.type === 'turn' && e.record) session.log.push(e.record);
@@ -306,7 +350,8 @@ export class Games extends EventEmitter {
 
   // ---------------------------------------------------------------- lifecycle
 
-  async end(session: GameSession, status: GameStatus, why: string): Promise<void> {
+  /** `record`: keep an `ended` record (not for a toolsets/close, nor a game replaced by a new one: the toolset goes on). */
+  async end(session: GameSession, status: GameStatus, why: string, cause?: unknown, record = true): Promise<void> {
     if (!this.sessions.has(session.id)) return;
     this.sessions.delete(session.id);
     if (this.byOwner.get(session.owner.sub) === session) this.byOwner.delete(session.owner.sub);
@@ -319,8 +364,15 @@ export class Games extends EventEmitter {
     this.recent.splice(30);
     try { appendFileSync(join(this.config.dataDir, 'results.jsonl'), JSON.stringify({ ...pub, why }) + '\n'); } catch (e) { this.log(`results write failed: ${(e as Error).message}`); }
     this.log(`${session.owner.name}'s game ${session.id} ended: ${session.status} (${why})`);
+    // id: the game's own (random, never reused for this player), so a host can dedupe across reconnects.
+    if (record) {
+      const records = this.ended.get(session.owner.sub) ?? [];
+      records.push({ id: `game-${session.id}`, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt });
+      this.ended.set(session.owner.sub, records.slice(-20));
+    }
     this.emit('ended', session);
     this.emit('list');
+    this.emit('state', session.owner.sub, { cause, ended: { session, why } } satisfies StateChange);
   }
 
   private sweep() {
@@ -349,10 +401,10 @@ export class Games extends EventEmitter {
     } catch { /* fresh start */ }
   }
 
-  private requireMine(owner: Principal): GameSession {
+  private requireMine(owner: Principal, cause?: unknown): GameSession {
     const s = this.byOwner.get(owner.sub);
     if (!s) throw new Fault(409, 'You have no game running. Call game_start first.');
-    if (s.engine.closed) { void this.end(s, 'stopped', 'engine exited'); throw new Fault(500, 'Your game engine has exited; call game_start to begin a new game.'); }
+    if (s.engine.closed) { void this.end(s, 'stopped', 'engine exited', cause); throw new Fault(500, 'Your game engine has exited; call game_start to begin a new game.'); }
     return s;
   }
 

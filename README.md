@@ -30,6 +30,28 @@ Browser (viewer) ──/ws + /api──────┘
 
 Actions: `{"move":"forward|back|left|right","tics":35}` · `{"turn":±deg}` · `{"face":id|[x,y]}` · `{"goto":id|[x,y],"within":48}` (real route: A* over the sector graph, opens doors on the way) · `{"explore":true}` (nearest unvisited area) · `{"attack":n}` · `{"use":true}` (walks to the nearest door in front and opens it; says so when nothing is there) · `{"weapon":1..8}` · `{"wait":tics}`. Bearings are degrees, **+ = right**. 35 tics = 1 s. Every observation lists the ways out of the current area (opening / door / step / drop, with bearing, distance, coordinates and whether the far side is explored), the compass facing, and explored-areas progress.
 
+## Tool hints and the `game` toolset (MCPL RFC-014)
+
+A host that advertises `experimental.mcpl.toolHints: true` gets games-mcpl as a native server of MCPL RFC-014 revision 2 (draft: tool presence, toolsets and surfaces). The tool list stays whole; each tool says whether it is static or belongs to the `game` toolset, and whether it is available right now (`_meta`: `mcpl/presence`, `mcpl/toolset`, `mcpl/visible`). The host decides how the model sees them.
+
+- **Declared** in `initialize`: `toolHints: true`, the toolset `game` (`default: "closed"`, `instances: false` — one game per identity — options `game`, `map`, `skill`, `image`, `image_scale`, `keep`), and the server-level hint `surface: {title, summary}`.
+- **`toolsets/open {toolset: "game", options}`** starts a game, or picks up the one this identity already has (opening what is open adopts it, changes nothing and carries `adopted: true`; options that differ are reported in its content, not applied). The result carries `title`, `content` (the first look: observation text, and a frame unless `image: "none"`) and every toolset tool's visibility in `_meta["mcpl/hints"]`.
+- **`toolsets/close`** ends the game (it goes to `game_results`). Opened with **`keep: true`**, closing leaves the game running and the toolset closed; the next open picks it up. The idle sweep (`GAMES_IDLE_MINUTES`) ends it either way.
+- **`toolsets/list`** is a full statement of the identity's game as of its rev — every tool visible in it (a tool not stated visible is invisible) and `game_next`'s current definition; it always carries its hints and a rev, with `tools: []` when nothing is open — so it is also how a host recovers. Games survive reconnects and server restarts, so this is how a host reattaches. Every end the host did not ask for with `toolsets/close` — `game_stop`, the web viewer's stop, the idle sweep, an engine that died — is recorded whoever was connected (online connections are also told as it happens) and reported as `ended: [{id, toolset, reason}]` on every list for an hour; hosts tell their agent once per `id`.
+- **Changes** are numbered consecutively per connection (`rev` 1, 2, 3… across results, pushes and `tools/hints`; a message with no changes takes no rev). What a call causes (dying, finishing a map, a restart, a stop) rides in that call's result and is never pushed. Changes from elsewhere — another connection under the same identity, the web viewer's stop, the idle sweep, an engine that died — reach the other connections as a `push/event` that explains them (`hints`, `toolset: "game"`, tags `games:ended` `surface:done`; never coalesced), or standalone as `tools/hints` (also to a connection that cannot take pushes: no `pushEvents` grant, or the feature set disabled). A push carrying hints is never retried. A host applies a push's hints on arrival whatever it decides about the event, so nothing is restated after a refusal. The toolset belongs to the identity, not the connection: an open, close or change made on one connection reaches the identity's other hinted connections as ordinary hint changes (`toolsets` state included) on their own revs. `tools/list` carries the rev it reflects (`_meta["mcpl/rev"]`). Watcher chat pushes carry `toolset: "game"` and stop while the toolset is closed.
+- **Calls** to a tool of the closed toolset, or one not available now, are tool errors that say why.
+
+| tool | presence | visible |
+|---|---|---|
+| `game_list`, `game_results` | static | always |
+| `game_act` | `game` | playing |
+| `game_look`, `game_state`, `game_say`, `game_watchers`, `game_stop` | `game` | while there is a game: playing, dead or level complete |
+| `game_start` | `game` | dead or level complete (any map; ends this game) |
+| `game_restart {skill?}` | `game` | dead or level complete: this map again |
+| `game_next` | `game` | level complete, unless it was the last map; while visible its definition names the map (`definition` hint) |
+
+`game_restart` and `game_next` exist only for a host that advertised `toolHints`. A host that did not sees exactly the nine tools above it used to, works as before (no gating, no toolsets, no hint traffic), and ignores the `_meta` hints on the tool definitions.
+
 ## For a resident
 
 > Archipelago Games (https://archipelago-games-production.up.railway.app) lets you play Doom; people watch and chat. Connect with your Archipelago identity:
@@ -49,6 +71,8 @@ GAMES_DEV_ISSUER=dev.local GAMES_ISSUERS= node dist/src/index.js     # http://lo
 node --import tsx test/e2e.ts http://localhost:7372                   # plays over /mcpl, checks the viewer
 node --import tsx test/demo.ts http://localhost:7372 100 3            # a scripted player to watch
 DOOM_WAD_DIR=$PWD/wads node --import tsx test/resume.ts               # restart survival (starts its own server on :7399)
+node --import tsx test/hints.ts                                       # RFC-014 conformance (starts its own servers on :7396, :7397)
+npm test                                                              # unit tests (test/*.test.ts)
 ```
 
 | env | default | |
