@@ -261,13 +261,12 @@ async function run() {
   for (let i = 0; i < 60 && !died; i++) {
     mark = h1.wire.length;
     r = await h1.tool('game_act', { actions: i % 2 ? [{ wait: 350 }] : [{ attack: 1 }, { explore: true }], stop_on: ['dead'], image: 'none' });
-    // The engine's autosave after a turn runs a few tics, so a death can land between turns; the
-    // next game_act then reads "Episode is over". Either way that call is the one that reports it.
-    if (/YOU DIED|Episode is over/.test(textOf(r))) died = r; else assert.equal(hintsOf(r), undefined, `no changes while playing on; got them with:\n${textOf(r)}`);
+    // The autosave pauses the world, so a death always lands inside a turn: that call reports it.
+    if (/YOU DIED/.test(textOf(r))) died = r; else assert.equal(hintsOf(r), undefined, `no changes while playing on; got them with:\n${textOf(r)}`);
   }
   assert.ok(died, 'expected to die on Nightmare within 60 turns');
   show('the call that died: result _meta', died._meta);
-  if (/YOU DIED/.test(textOf(died))) assert.match(textOf(died), /game_restart tries the map again/);
+  assert.match(textOf(died), /game_restart tries the map again/);
   assert.deepEqual(vis(hintsOf(died)), { game_act: false, game_start: true, game_restart: true });
   await sleep(400);
   assert.deepEqual(h1.unsolicited(mark), [], 'no push or tools/hints for a call\'s own consequences');
