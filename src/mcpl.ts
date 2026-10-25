@@ -422,8 +422,11 @@ export class McplSession {
                 ...(g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : []),
                 ...this.app.go.instances(this.actor.sub).map((r) => ({ toolset: GO, instance: r.name, title: this.app.go.title(r) })),
               ];
-              const ended = this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS);
-              if (ended.length) body.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
+              const ended = [
+                ...this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS).map((e) => ({ at: e.at, r: { id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` } })),
+                ...this.app.go.endedRecords(this.actor.sub, ENDED_WINDOW_MS).map((e) => ({ at: e.at, r: { id: e.id, toolset: GO, instance: e.instance, reason: e.reason } })),
+              ].sort((a, b) => a.at - b.at).map((x) => x.r);
+              if (ended.length) body.ended = ended;
               this.told = new Map();
             }
             let h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full, mayOpen: true });

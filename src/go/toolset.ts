@@ -124,6 +124,12 @@ export class GoTables extends EventEmitter {
   private counters = new Map<string, number>();
   /** Events for a principal no connection could take, delivered after its next toolsets/list. */
   private held = new Map<string, GoEvent[]>();
+  /**
+   * Instances that ended other than by toolsets/close (RFC-014 §5.3 `ended`, r5) — go_cancel, the one
+   * way a Go instance ends by itself — recorded whoever was connected. Game over does not end an
+   * instance (go_rematch and go_sgf stay). In memory only.
+   */
+  private ended = new Map<string, Array<{ id: string; instance: string; reason: string; at: number }>>();
 
   constructor(private dir: string, private bots: BotPool, private log: (m: string) => void) {
     super();
@@ -197,6 +203,18 @@ export class GoTables extends EventEmitter {
     }
     if (m.phase === 'over' && m.result) lines.push(`Result: ${m.result}.`);
     return lines.join('\n');
+  }
+
+  /** id: the match code (random) and the instance name, so it is unique for the principal. */
+  private recordEnd(sub: string, instance: string, id: string, reason: string) {
+    this.ended.set(sub, [...(this.ended.get(sub) ?? []), { id, instance, reason, at: Date.now() }].slice(-20));
+  }
+
+  /** A principal's `ended` records from the last `withinMs`. */
+  endedRecords(sub: string, withinMs: number) {
+    const keep = (this.ended.get(sub) ?? []).filter((e) => e.at > Date.now() - withinMs);
+    if (keep.length) this.ended.set(sub, keep); else this.ended.delete(sub);
+    return keep;
   }
 
   /** Held events for a principal (each delivered once). */
@@ -332,7 +350,13 @@ export class GoTables extends EventEmitter {
         this.save(m);
         return ok(`Took back ${back + 1} move${back ? 's' : ''}.`, this.view(r));
       }
-      case 'go_cancel': { this.withdraw(m); this.leave(m, me); return ok('Withdrawn: nobody had joined. The instance is closed.'); }
+      case 'go_cancel': {
+        const sub = m.agent(me)!.sub;
+        this.withdraw(m); this.leave(m, me);
+        // The call's result reports the instance closing; the record is kept as well (RFC-014 r5 §5.3).
+        this.recordEnd(sub, r.name, `go-${m.code}-${r.name}`, `withdrawn with go_cancel before anyone joined (${m.code})`);
+        return ok('Withdrawn: nobody had joined. The instance is closed.');
+      }
       case 'go_mark_dead': {
         const pts = (Array.isArray(a.points) ? a.points : []).map((s) => ({ s: String(s), p: parsePoint(String(s), g.n) }));
         if (!pts.length) return fail('points: give at least one point, e.g. ["C3"].');

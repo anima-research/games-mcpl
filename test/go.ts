@@ -8,8 +8,9 @@
 //     an opponent offline whose events wait for their next toolsets/list; a forfeit on close;
 //   - reconnect and server restart: toolsets/list reports the instance, the game goes on;
 //   - a host without toolHints never sees Go.
-// RFC-014 §13 vectors: 1, 2, 4, 5, 6, 9, 14, 16, 17, 18, 19; and r4's consecutive revs (every
-// host here asserts rev = last + 1 on every message) and full toolsets/list statements.
+// RFC-014 §13 vectors: 1, 2, 4, 5, 6, 9, 14, 16, 17, 18, 19; r4's consecutive revs (every host
+// here asserts rev = last + 1 on every message) and full toolsets/list statements; r5's name
+// grammar, `ended` for an end a call caused, and tools/hints for a connection without pushes.
 //   npm run build && node --import tsx test/go.ts
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -45,7 +46,7 @@ class Host {
   lastRev = 0;
   /** Ids of toolsets/list requests: their results are full statements that replace the per-instance state. */
   private lists = new Set<number>();
-  constructor(readonly label: string, private tok: string, private toolHints = true) {}
+  constructor(readonly label: string, private tok: string, private toolHints = true, private grantPushes = true) {}
   connect() {
     return new Promise<void>((res, rej) => {
       this.ws = new WebSocket(`${base.replace('http', 'ws')}/mcpl?token=${encodeURIComponent(this.tok)}`);
@@ -83,7 +84,7 @@ class Host {
   async init() {
     const r = await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.5', ...(this.toolHints ? { toolHints: true } : {}) } } }, clientInfo: { name: `go-${this.label}`, version: '0' } });
     this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
-    await this.call('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabledFeatureSets: ['*'] });
+    await this.call('featureSets/update', { effectiveCapabilities: this.grantPushes ? ['tools', 'pushEvents'] : ['tools'], enabledFeatureSets: ['*'] });
     return r.result;
   }
   async open(options: Msg, instance?: string) { const r = await this.call('toolsets/open', { toolset: 'go', ...(instance ? { instance } : {}), options }); if (r.error) throw new Error(`open: ${r.error.message}`); return r.result; }
@@ -115,6 +116,15 @@ async function botGame(ada: Host) {
   const second = await ada.open({ level: 'easy' });
   assert.equal(second.instance, 'go-1');
   assert.equal((await ada.call('toolsets/open', { toolset: 'go', instance: 'no spaces' })).error?.code, -32602, 'an invalid name is refused, never replaced');
+  // RFC-014 r5 §5.2: names match ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ — every such name is taken as given, every other refused
+  for (const bad of ['', '-x', '.x', '_x', 'x/y', 'é', 'x'.repeat(65)]) {
+    assert.equal((await ada.call('toolsets/open', { toolset: 'go', instance: bad, options: { level: 'easy' } })).error?.code, -32602, `"${bad}" is refused`);
+  }
+  for (const good of ['A', '7', 'a.b_c-9', 'x'.repeat(64)]) {
+    const r = (await ada.call('toolsets/open', { toolset: 'go', instance: good, options: { level: 'easy' } })).result;
+    assert.equal(r.instance, good, `"${good}" is used as given`);
+    await ada.call('toolsets/close', { toolset: 'go', instance: good });
+  }
   // RFC-014 r4 §5.3: toolsets/list is a full statement — every tool visible in each open instance
   // (anything not stated visible is invisible), each entry naming its instance
   const full = (await ada.call('toolsets/list')).result;
@@ -261,6 +271,21 @@ async function main() {
     assert.match(textOf(r), /Rematch on: you are Black\. Your move\./);
     await waitFor('the rematch on ada', () => ada.pushes(am).find((p) => /accepted the rematch/.test(p.payload.content[0].text)));
     assert.deepEqual(ada.visible('g'), ['go_resign']);
+    // RFC-014 r5 §6.2: an opponent whose connection cannot take pushes (no pushEvents grant) gets the
+    // change as tools/hints
+    const cy = new Host('cy', await token('Hints Cy'), true, false); await cy.connect(); await cy.init();
+    const np = await ada.open({ opponent: 'agent' }, 'np');
+    await cy.open({ join: /join: "([0-9A-F]{6})"/.exec(textOf(np))![1] }, 'np');
+    const mc = cy.wire.length;
+    await waitFor('the join on ada', () => ada.visible('np').includes('go_play'));
+    await ada.tool('go_play', { point: 'C3' }, 'np');
+    const standalone = await waitFor('tools/hints on cy', () => cy.wire.slice(mc).find((m) => m.method === 'tools/hints'));
+    assert.equal(standalone.params.tools.find((t: Msg) => t.name === 'go_play').visible, true);
+    assert.ok(!cy.wire.some((m) => m.method === 'push/event'), 'no pushes to a connection without the grant');
+    await ada.tool('go_resign', {}, 'np');
+    await ada.call('toolsets/close', { toolset: 'go', instance: 'np' });
+    cy.close();
+
     // a forfeit: Bo leaves a live game
     am = ada.wire.length;
     const left = (await bo.call('toolsets/close', { toolset: 'go', instance: 'g' })).result;
@@ -291,6 +316,22 @@ async function main() {
     assert.equal(again.adopted, true); assert.match(textOf(again), new RegExp(`move ${moves}`));
     r = await ada2.tool('go_play', { point: 'B8' }, 'first');
     assert.match(textOf(r), /You played B8/);
+
+    // RFC-014 r5 §5.3: an instance that ends other than by toolsets/close (go_cancel) is recorded even
+    // though the connection that caused it was online (its result reported it), and a later
+    // connection finds the record by id on every list
+    const w = await ada2.open({ opponent: 'agent' }, 'w');
+    const wcode = /join: "([0-9A-F]{6})"/.exec(textOf(w))![1];
+    r = await ada2.tool('go_cancel', {}, 'w');
+    assert.deepEqual(hintsOf(r)!.toolsets, [{ toolset: 'go', instance: 'w', state: 'closed' }], 'the call\'s result reports the end');
+    const ada3 = new Host('ada3', adaTok); await ada3.connect(); await ada3.init();
+    const l3 = (await ada3.call('toolsets/list')).result;
+    show('toolsets/list on a later connection after a go_cancel', l3.ended);
+    const rec = { id: `go-${wcode}-w`, toolset: 'go', instance: 'w', reason: `withdrawn with go_cancel before anyone joined (${wcode})` };
+    assert.deepEqual(l3.ended, [rec]);
+    assert.deepEqual((await ada3.call('toolsets/list')).result.ended, [rec], 'every list, the same id');
+    assert.deepEqual((await ada2.call('toolsets/list')).result.ended, [rec], 'and on the connection that caused it');
+    ada3.close();
 
     // a host without toolHints never sees Go
     const plain = new Host('plain', adaTok, false); await plain.connect(); await plain.init();
