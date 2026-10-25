@@ -148,11 +148,12 @@ export class Games extends EventEmitter {
   readonly recent: PublicGame[] = [];
   private byOwner = new Map<string, GameSession>();
   /**
-   * Each player's ended games, for MCPL toolsets/list `ended` (RFC-014 §5.3). `told`: a hinted
-   * connection that had the toolset open heard of the end as it happened, so it is not reported.
-   * In memory only: after a restart there is nothing to report.
+   * Each player's ended games, for MCPL toolsets/list `ended` (RFC-014 §5.3): every end the host did
+   * not ask for with toolsets/close — the player's own game_stop, the web viewer's stop, the idle
+   * sweep, an engine that died — whoever was connected. In memory only: after a restart there is
+   * nothing to report.
    */
-  readonly ended = new Map<string, Array<{ id: string; why: string; summary: string; at: number; told: boolean }>>();
+  readonly ended = new Map<string, Array<{ id: string; why: string; summary: string; at: number }>>();
 
   /** A player's `ended` records from the last `withinMs` (older ones are dropped). */
   endedRecords(sub: string, withinMs: number) {
@@ -210,7 +211,7 @@ export class Games extends EventEmitter {
         return { session: existing, obs };
       });
     }
-    if (existing) await this.end(existing, 'stopped', 'replaced by a new game', cause);
+    if (existing) await this.end(existing, 'stopped', 'replaced by a new game', cause, false);
     if (this.sessions.size >= this.config.maxGames) throw new Fault(503, `All ${this.config.maxGames} game slots are busy right now; try again in a little while.`);
 
     const id = `g${randomBytes(4).toString('hex')}`;
@@ -273,10 +274,11 @@ export class Games extends EventEmitter {
     return session;
   }
 
-  async stop(owner: Principal, cause?: unknown): Promise<GameSession | null> {
+  /** End the player's game. `byClose`: the MCPL host closed its toolset, an end it asked for (not an `ended` record). */
+  async stop(owner: Principal, cause?: unknown, byClose = false): Promise<GameSession | null> {
     const session = this.byOwner.get(owner.sub);
     if (!session) return null;
-    await this.end(session, 'stopped', 'stopped by the player', cause);
+    await this.end(session, 'stopped', byClose ? 'the game toolset was closed' : 'stopped by the player', cause, !byClose);
     return session;
   }
 
@@ -348,7 +350,8 @@ export class Games extends EventEmitter {
 
   // ---------------------------------------------------------------- lifecycle
 
-  async end(session: GameSession, status: GameStatus, why: string, cause?: unknown): Promise<void> {
+  /** `record`: keep an `ended` record (not for a toolsets/close, nor a game replaced by a new one: the toolset goes on). */
+  async end(session: GameSession, status: GameStatus, why: string, cause?: unknown, record = true): Promise<void> {
     if (!this.sessions.has(session.id)) return;
     this.sessions.delete(session.id);
     if (this.byOwner.get(session.owner.sub) === session) this.byOwner.delete(session.owner.sub);
@@ -362,9 +365,11 @@ export class Games extends EventEmitter {
     try { appendFileSync(join(this.config.dataDir, 'results.jsonl'), JSON.stringify({ ...pub, why }) + '\n'); } catch (e) { this.log(`results write failed: ${(e as Error).message}`); }
     this.log(`${session.owner.name}'s game ${session.id} ended: ${session.status} (${why})`);
     // id: the game's own (random, never reused for this player), so a host can dedupe across reconnects.
-    const records = this.ended.get(session.owner.sub) ?? [];
-    records.push({ id: `game-${session.id}`, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt, told: false });
-    this.ended.set(session.owner.sub, records.slice(-20));
+    if (record) {
+      const records = this.ended.get(session.owner.sub) ?? [];
+      records.push({ id: `game-${session.id}`, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt });
+      this.ended.set(session.owner.sub, records.slice(-20));
+    }
     this.emit('ended', session);
     this.emit('list');
     this.emit('state', session.owner.sub, { cause, ended: { session, why } } satisfies StateChange);

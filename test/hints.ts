@@ -51,7 +51,7 @@ class Host {
   wire: Msg[] = [];
   /** Answer pushes with accepted:false (a host whose policy refuses them). */
   refuse = false;
-  constructor(readonly label: string, private token: string, private toolHints: boolean) {}
+  constructor(readonly label: string, private token: string, private toolHints: boolean, private pushes = true) {}
   connect() {
     return new Promise<void>((res, rej) => {
       this.ws = new WebSocket(`${base.replace('http', 'ws')}/mcpl?token=${encodeURIComponent(this.token)}`);
@@ -69,7 +69,7 @@ class Host {
     const mcpl = { version: '0.5', ...(this.toolHints ? { toolHints: true } : {}) };
     const r = await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl } }, clientInfo: { name: `hints-${this.label}`, version: '0' } });
     this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
-    await this.call('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabledFeatureSets: ['*'] });
+    await this.call('featureSets/update', { effectiveCapabilities: this.pushes ? ['tools', 'pushEvents'] : ['tools'], enabledFeatureSets: ['*'] });
     return r.result;
   }
   async tool(name: string, args: unknown = {}) { const r = await this.call('tools/call', { name, arguments: args }); if (r.error) throw new Error(`${name}: ${r.error.message}`); return r.result; }
@@ -167,11 +167,15 @@ async function scripted() {
   show('a refused push, then the next change', { refused: refused.params.hints.rev, next: hintsOf(nextChange)!.rev });
   assert.equal(hintsOf(nextChange)!.rev, refused.params.hints.rev + 1, 'the next change takes the next rev');
   await h.call('toolsets/close', { toolset: 'game' });
-  // §5.3 `ended`: a game that ends while no connection could be told is reported by toolsets/list, as a
-  // record with an id, on every list until it expires (hosts dedupe by id); one a connection heard of
-  // as it happened is not
+  // §5.3 `ended` (r5): every end the host did not ask for with toolsets/close is recorded, whoever was
+  // connected — the two web stops above ended games while `h` was online and was pushed them, and a
+  // later connection still finds both records, by id, on every list until they expire
   const told = new Host('told', tok.token, true); await told.connect(); await told.init();
-  assert.deepEqual((await told.call('toolsets/list')).result, { open: [] });
+  const lt = (await told.call('toolsets/list')).result;
+  show('toolsets/list on a later connection, after ends another connection saw', lt);
+  assert.deepEqual(lt.open, []);
+  assert.deepEqual(lt.ended.map((e: Msg) => e.id), [`game-${id}`, `game-${id2}`], 'recorded although h was online; the toolsets/close is not');
+  assert.match(lt.ended[0].reason, /^stopped by Hints Tester/);
   const o3 = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
   const id3 = /\/g\/(g[0-9a-f]+)/.exec(textOf(o3))![1];
   h.close(); told.close(); await sleep(200);
@@ -180,23 +184,33 @@ async function scripted() {
   const l1 = (await later.call('toolsets/list')).result;
   show('toolsets/list after a game ended unseen', l1);
   assert.deepEqual(l1.open, []);
-  assert.deepEqual(l1.ended, [{ id: `game-${id3}`, toolset: 'game', reason: 'stopped by Hints Tester (freedoom1 E1M1, turn 0)' }]);
+  assert.deepEqual(l1.ended.at(-1), { id: `game-${id3}`, toolset: 'game', reason: 'stopped by Hints Tester (freedoom1 E1M1, turn 0)' });
+  assert.deepEqual(l1.ended.map((e: Msg) => e.id), [`game-${id}`, `game-${id2}`, `game-${id3}`]);
   assert.deepEqual((await later.call('toolsets/list')).result.ended, l1.ended, 'every list, the same id');
   const other = new Host('other', tok.token, true); await other.connect(); await other.init();
   assert.deepEqual((await other.call('toolsets/list')).result.ended, l1.ended, 'a reconnect: the same record, the same id');
-  await later.call('toolsets/open', { toolset: 'game', options: { image: 'none' } });
+  const o4 = (await later.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  const id4 = /\/g\/(g[0-9a-f]+)/.exec(textOf(o4))![1];
   const fresh = new Host('fresh', tok.token, true); await fresh.connect(); await fresh.init();
   const lf = (await fresh.call('toolsets/list')).result;
   assert.deepEqual(lf.ended, l1.ended, 'a second reconnect, with a newer game open: still the same id until it expires');
   assert.equal(lf.open.length, 1);
-  await later.call('toolsets/close', { toolset: 'game' });
-  for (const host of [h, told, later, other, fresh]) {
+  // r5 §6.2: a connection that cannot take pushes (no pushEvents grant) gets the change as tools/hints
+  const nopush = new Host('nopush', tok.token, true, false); await nopush.connect(); await nopush.init();
+  await nopush.call('toolsets/list');
+  const mp = nopush.wire.length; const ml = later.wire.length;
+  assert.equal((await post(`/api/games/${id4}/stop`, {}, { Authorization: `Bearer ${tok.token}` })).status, 200);
+  const standalone = await waitFor('tools/hints on the no-push connection', () => nopush.wire.slice(mp).find((m) => m.method === 'tools/hints'));
+  assert.deepEqual(standalone.params.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  assert.ok(!nopush.wire.some((m) => m.method === 'push/event'));
+  await waitFor('the push on the connection that can take it', () => later.wire.slice(ml).find((m) => m.method === 'push/event' && m.params?.hints));
+  for (const host of [h, told, later, other, fresh, nopush]) {
     assert.ok(!host.wire.some((m) => m.method === 'push/event' && m.params?.hints && m.params?.coalesce), 'vector 19');
     // RFC-014 r4: consecutive revs on each connection, across results, pushes and tools/hints
     const revs = host.hints().map((x) => x.h.rev);
     revs.forEach((rev, i) => assert.equal(rev, i + 1, `${host.label}: revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ')})`));
   }
-  for (const host of [later, other, fresh]) host.close();
+  for (const host of [later, other, fresh, nopush]) host.close();
 }
 
 async function run() {
@@ -333,7 +347,9 @@ async function run() {
   const closed = (await h1b.call('toolsets/close', { toolset: 'game' })).result;
   assert.match(textOf(closed), /Stopped your game/);
   assert.deepEqual(hintsOf(closed)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
-  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] }, 'told as it happened: not reported as ended');
+  const afterClose = (await h1b.call('toolsets/list')).result;
+  assert.deepEqual(afterClose.open, []);
+  assert.deepEqual(afterClose.ended.map((e: Msg) => e.id), [`game-${gameId}`], 'the plain host\'s game_stop is recorded; this toolsets/close is not');
   const closedOnH2 = await waitFor('the close on h2', () => h2.wire.slice(m5).find((m) => m.method === 'push/event' && m.params?.hints));
   assert.deepEqual(closedOnH2.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
 
@@ -344,7 +360,7 @@ async function run() {
   assert.match(textOf(kept), /stays on the server/);
   await sleep(100); // other connections are told after a 25 ms debounce; let h2 see this step on its own
   assert.deepEqual(hintsOf(kept)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
-  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] }, 'a kept game is not open');
+  assert.deepEqual((await h1b.call('toolsets/list')).result.open, [], 'a kept game is not open');
   r = await h1b.tool('game_act', { actions: [{ wait: 1 }] });
   assert.ok(r.isError && /kept on the server/.test(textOf(r)));
   assert.match(textOf(await h1b.tool('game_list')), /Kept on the server/);

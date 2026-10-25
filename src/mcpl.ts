@@ -232,17 +232,12 @@ export class McplSession {
    */
   onGameState(change: StateChange) {
     if (!this.toolHints || !this.ready || this.closed) return;
-    // A connection with the toolset open hears of an end as it happens (in its call's result, or
-    // below), so toolsets/list later need not report it as `ended`.
-    if (change.ended && this.told.open) {
-      const e = this.app.games.ended.get(this.actor.sub)?.find((x) => x.id === `game-${change.ended!.session.id}`);
-      if (e) e.told = true;
-    }
     if (change.cause === this) return;
     if (change.ended && this.told.open) {
       const s = change.ended.session;
       const byPeer = change.cause instanceof McplSession;
       const why = byPeer && change.ended.why === 'stopped by the player' ? 'it was stopped from another connection under your identity'
+        : byPeer && change.ended.why === 'the game toolset was closed' ? 'it was closed from another connection under your identity'
         : byPeer && change.ended.why === 'replaced by a new game' ? 'a new game was started from another connection under your identity'
         : change.ended.why;
       this.peerEnded = { id: `ended_${s.id}`, text: `[games] Your game ended (${why}): ${s.game} ${s.map}, turn ${s.turn}${s.status === 'stopped' ? '' : `, ${STATUS_WORD[s.status]}`}. game_results lists it; opening the game toolset starts a new one.` };
@@ -356,12 +351,13 @@ export class McplSession {
             if (m.method === 'toolsets/list') {
               // RFC-014 §5.3: what this identity holds open, and its hint state in full as of this
               // result's rev (a tool not stated visible is invisible); the host replaces its state with it.
-              // And games that ended while no connection could be told (the idle sweep, the web stop):
-              // `ended` records, each with an id, on every list until they expire; hosts dedupe by id.
+              // And every end the host did not ask for with toolsets/close (game_stop, the web stop, the
+              // idle sweep, a dead engine), whoever was connected: `ended` records, each with an id, on
+              // every list until they expire; hosts tell their agent once per id.
               const g = this.gameView();
               const b = body as Record<string, unknown>;
               b.open = g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : [];
-              const ended = this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS).filter((e) => !e.told);
+              const ended = this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS);
               if (ended.length) b.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
               this.told = closedTold();
             }
@@ -462,7 +458,7 @@ export class McplSession {
       games.setToolset(s, { parked: true }, this);
       said = `Your game stays on the server: ${titleOf(s)}, turn ${s.turn}${s.status === 'running' ? '' : `, ${STATUS_WORD[s.status]}`}. Opening the game toolset picks it up; a game nobody plays for ${this.app.config.idleMinutes} minutes ends.`;
     } else {
-      await games.stop(this.actor, this);
+      await games.stop(this.actor, this, true);
       said = `Stopped your game (${s.game} ${s.map}, turn ${s.turn}${s.status === 'stopped' ? '' : `, ${STATUS_WORD[s.status]}`}). game_results lists it.`;
     }
     return { content: [{ type: 'text', text: said }] };
