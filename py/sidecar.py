@@ -135,6 +135,7 @@ class Doom:
         self.nav = None       # NavMap for the current episode
         self.visited = set()  # sector ids the player has stood in
         self.gave_up = {}     # sector id -> failed explore attempts (2 = skip it)
+        self.paused = False   # left paused by save(); the next turn's first tic (_tic) unpauses
 
     # ── lifecycle ──
     def start(self, game="freedoom1", map=None, skill=3, width=320, height=240, image="frame", image_scale=1.0, load=None, visited=None, gave_up=None, turn=0):
@@ -179,6 +180,8 @@ class Doom:
             g.init()
             self.g, self.game, self.skill, self.res = g, game, skill, res
         else:
+            if self.paused:
+                self._tic([0] * len(BUTTONS), 1)  # unpause the old episode before replacing it
             self.g.set_doom_map(map)
         self.map = map
         self.g.new_episode()
@@ -206,20 +209,47 @@ class Doom:
         return self.observe(events=events, image=image, image_scale=float(image_scale))
 
     def save(self, name="autosave"):
-        """Write a ZDoom savegame (<name>.zds in the engine's cwd) plus the navigation memory. Only while the episode is live."""
+        """Write a ZDoom savegame (<name>.zds in the engine's cwd) plus the navigation memory. Only while the episode is live.
+
+        The engine needs tics to save (the file lands 2 tics after the command), and the world must not
+        get them: the server autosaves after every turn, and tics spent there let monsters hit, or kill,
+        a player standing still between turns. So the game is paused first. It stays paused after the
+        save, and the next turn's first tic carries the unpause (_tic), so the world only moves in turns.
+        """
         self.require()
         if self.finished():
             return {"saved": False, "reason": "episode over"}
+        zero = [0] * len(BUTTONS)
+        if not self.paused:
+            self.g.send_game_command("pause")       # lands on the next tic, before the world runs it
+            self.g.make_action(zero, 1)
         self.g.send_game_command(f"save {name} games-mcpl-autosave")
         before = os.path.getmtime(f"{name}.zds") if os.path.exists(f"{name}.zds") else None
         ok = False
-        for _ in range(8):                           # the engine writes the file a few tics later
-            self.g.make_action([0] * len(BUTTONS), 5)
+        for _ in range(40):
+            t = self.g.get_episode_time()
+            self.g.make_action(zero, 1)
+            # a tic that does not advance the clock is a paused one; track it rather than assume it
+            self.paused = self.g.get_episode_time() == t
             if os.path.exists(f"{name}.zds") and os.path.getmtime(f"{name}.zds") != before:
                 ok = True
                 break
+        if not self.paused:
+            log("save: the game did not pause; the world ran during the save")
         ok = ok or os.path.exists(f"{name}.zds")
         return {"saved": ok, "file": os.path.abspath(f"{name}.zds"), "visited": sorted(self.visited), "gave_up": self.gave_up, "turn": self.turns}
+
+    def _tic(self, vec, n):
+        """make_action for a turn's own tics; the first one after a save also unpauses the game."""
+        if not self.paused:
+            return self.g.make_action(vec, n)
+        self.paused = False
+        t = self.g.get_episode_time()
+        self.g.send_game_command("pause")           # toggles the save's pause off on this tic, which runs normally
+        r = self.g.make_action(vec, n)
+        if self.g.get_episode_time() == t:
+            raise RuntimeError("the engine stayed paused after the autosave")
+        return r
 
     @staticmethod
     def _resolution(res):
@@ -229,6 +259,7 @@ class Doom:
         return getattr(vzd.ScreenResolution, name)
 
     def close(self):
+        self.paused = False
         if self.g is not None:
             try:
                 self.g.close()
@@ -509,7 +540,7 @@ class Doom:
         left = tics
         while left > 0:
             n = min(chunk, left)
-            self.g.make_action(vec, n)
+            self._tic(vec, n)
             left -= n
             r = self._check(stop_on, watch)
             if r:
@@ -551,7 +582,7 @@ class Doom:
         remaining = float(degrees)
         while abs(remaining) > 0.01:
             d = max(-MAX_TURN_PER_TIC, min(MAX_TURN_PER_TIC, remaining))
-            self.g.make_action(self._press(TURN_LEFT_RIGHT_DELTA=d), 1)
+            self._tic(self._press(TURN_LEFT_RIGHT_DELTA=d), 1)
             remaining -= d
         return self._check(stop_on, watch)
 
@@ -680,7 +711,7 @@ class Doom:
             vec = self._press(ATTACK=1)
             melee = float(self.g.get_game_variable(vzd.GameVariable.SELECTED_WEAPON)) in (1.0, 8.0)
             while tics < limit:
-                self.g.make_action(vec, 2)
+                self._tic(vec, 2)
                 tics += 2
                 if self.g.is_player_dead() or self.g.is_episode_finished():
                     break
@@ -693,7 +724,7 @@ class Doom:
                 if fired >= shots:
                     break
             # release and let the weapon settle for a few tics
-            self.g.make_action(self._press(), 4)
+            self._tic(self._press(), 4)
             hits = int(float(self.g.get_game_variable(vzd.GameVariable.HITCOUNT)) - hits0)
             used = int(ammo0 - float(self.g.get_game_variable(vzd.GameVariable.SELECTED_WEAPON_AMMO)))
             desc = f"attack ×{shots}: {used} ammo used, {hits} hit(s)"
@@ -713,7 +744,7 @@ class Doom:
                 return "use: door did not open", r
             # no door in reach: press anyway (switches), then say whether anything moved
             before = [(sec.floor_height, sec.ceiling_height) for sec in s.sectors] if s is not None else None
-            self.g.make_action(self._press(USE=1), 2)
+            self._tic(self._press(USE=1), 2)
             r = self._step(self._press(), int(action.get("tics", 25)), stop_on, watch)
             s2 = self.g.get_state()
             moved = 0
@@ -728,8 +759,8 @@ class Doom:
             n = int(action["weapon"])
             if n not in WEAPON_NAMES:
                 raise ValueError("weapon must be 1..8 (Doom: 1 fist, 2 pistol, 3 shotgun, 4 chaingun, 5 rocket, 6 plasma, 7 BFG, 8 chainsaw; Heretic: 1 staff, 2 wand, 3 crossbow, 4 dragon claw, 5 hellstaff, 6 phoenix rod, 7 firemace, 8 gauntlets)")
-            self.g.make_action(self._press(**{f"SELECT_WEAPON{n}": 1}), 2)
-            self.g.make_action(self._press(), 12)
+            self._tic(self._press(**{f"SELECT_WEAPON{n}": 1}), 2)
+            self._tic(self._press(), 12)
             sel = int(float(self.g.get_game_variable(vzd.GameVariable.SELECTED_WEAPON)))
             wn = HERETIC_WEAPONS if self.game == "heretic" else WEAPON_NAMES
             if sel != n:
@@ -779,17 +810,17 @@ class Doom:
         b, _ = self._bearing_to(mx, my)
         self._turn(b, stop_on, watch)
         for attempt in range(2):
-            self.g.make_action(self._press(USE=1), 2)
+            self._tic(self._press(USE=1), 2)
             for _ in range(10):
-                self.g.make_action(self._press(), 5)
+                self._tic(self._press(), 5)
                 s = self.g.get_state()
                 if s is None:
                     return False, "episode ended"
                 if not self.nav.closed(door_sector, s.sectors):
-                    self.g.make_action(self._press(), 10)  # let it rise a little more
+                    self._tic(self._press(), 10)  # let it rise a little more
                     return True, None
             # nudge closer and retry once
-            self.g.make_action(self._press(MOVE_FORWARD=1), 6)
+            self._tic(self._press(MOVE_FORWARD=1), 6)
         s = self.g.get_state()
         return False, "the door would not open (locked — needs a key or a switch elsewhere?)"
 
@@ -853,7 +884,7 @@ class Doom:
             if math.hypot(qx - last_pos[0], qy - last_pos[1]) < 12:
                 no_gain += 1
                 # a small sideways shuffle to unhook from a corner, alternating sides
-                self.g.make_action(self._press(**{"MOVE_LEFT" if no_gain % 2 else "MOVE_RIGHT": 1}), 5)
+                self._tic(self._press(**{"MOVE_LEFT" if no_gain % 2 else "MOVE_RIGHT": 1}), 5)
                 used += 5
             else:
                 no_gain = 0
@@ -893,7 +924,7 @@ class Doom:
     def _brake(self):
         """Doom keeps sliding after you let go; six idle tics settle the player before the next action."""
         if not self.g.is_episode_finished():
-            self.g.make_action(self._press(), 6)
+            self._tic(self._press(), 6)
 
     def _close_monster(self, limit=240):
         s = self.g.get_state()
@@ -915,7 +946,7 @@ class Doom:
         while left > 0:
             n = min(5, left)
             bx, by = self._pos()
-            self.g.make_action(vec, n)
+            self._tic(vec, n)
             left -= n
             r = self._check(stop_on, watch)
             if r:
