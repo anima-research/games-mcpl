@@ -10,12 +10,17 @@ import { createHttp } from './http.js';
 import { attachMcpl } from './mcpl.js';
 import { Engine } from './engine.js';
 import { syncWads, wadSyncFromEnv } from './wads.js';
+import { BotPool } from './go/bots.js';
+import { GoTables } from './go/toolset.js';
 
 const log = (m: string) => console.log(`${new Date().toISOString()} ${m}`);
 
 export class App {
   readonly root: string;
   games!: Games;
+  /** Go (the `go` toolset, for hosts with MCPL RFC-014 toolHints) and its bot's worker threads. */
+  go!: GoTables;
+  bots!: BotPool;
   wads: string[] = [];
   devIssuer: DevIssuer | null = null;
   private issuers = new Map<string, KeyObject>();
@@ -30,6 +35,8 @@ export class App {
   async init() {
     if (this.config.wadDir) this.wads = await syncWads(this.config.wadDir, wadSyncFromEnv(), log);
     this.games = new Games(this.config, (m) => log(`[games] ${m}`));
+    this.bots = new BotPool(this.config.goBots, (m) => log(`[go] ${m}`));
+    this.go = new GoTables(join(this.config.dataDir, 'go'), this.bots, (m) => log(`[go] ${m}`));
     if (this.config.devIssuer) {
       this.devIssuer = new DevIssuer(this.config.devIssuer, this.config.dataDir);
       this.issuers.set(this.config.devIssuer, (await resolveIssuers([{ domain: this.config.devIssuer, publicKey: this.devIssuer.publicKey }])).get(this.config.devIssuer)!);
@@ -75,7 +82,7 @@ async function main() {
   const { server } = createHttp(app, (m) => log(`[http] ${m}`));
   attachMcpl(server, app, (m) => log(`[mcpl] ${m}`));
   server.listen(config.port, config.host, () => log(`listening on http://${config.host}:${config.port} (origin ${config.origin}); MCPL at /mcpl, viewer at /`));
-  const bye = async () => { log('shutting down'); await app.games.shutdown(); server.close(); process.exit(0); };
+  const bye = async () => { log('shutting down'); await app.games.shutdown(); app.bots.close(); server.close(); process.exit(0); };
   process.on('SIGINT', bye); process.on('SIGTERM', bye);
 }
 

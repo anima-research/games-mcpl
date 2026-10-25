@@ -9,6 +9,12 @@
 // the call that caused them, on a push event that explains them, or as tools/hints. A host that
 // does not advertise toolHints sees the server exactly as before; only the tool definitions carry
 // extra `_meta` hints, which it ignores. See src/hints.ts for the visibility table.
+//
+// Go is a second toolset, `go`, with named instances (src/go/toolset.ts): a call names its game in
+// `_meta["mcpl/instance"]`, hint changes carry `instance`, and a move against another identity
+// reaches that player as a push (surface:turn) carrying their visibility change. Go is offered
+// only to hosts that advertise toolHints (RFC-014 §6.3 tailoring): it needs instances and per-turn
+// visibility, and a plain host would get ten more always-listed tools in every resident's header.
 import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -18,9 +24,10 @@ import { describe, ACTION_HELP } from './describe.js';
 import type { Observation } from './engine.js';
 import { nextMap, type GameSession, type GameStatus, type Principal, type StateChange } from './games.js';
 import {
-  TOOLSET, closedTold, current, diff, hinted, isGameTool, unavailable,
-  type GameView, type HintChanges, type Told, type Tool,
+  GAME_TOOLS, TOOLSET, current, diffUnits, hinted, isGameTool, unavailable, unitKey, unitOf,
+  type Changes, type GameView, type HintChanges, type Units, type Tool,
 } from './hints.js';
+import { GO, GO_TOOLS, GO_TOOL_NAMES, goDeclaration, isGoTool, type GoChange, type GoEvent, type GoRef } from './go/toolset.js';
 import {
   EMPTY_GRANT, buildReceipt, deriveFeatureSetState, narrowGrant, parsePolicy,
   type FeatureSetDeclaration05, type FeatureSetMap, type FeatureSetWireEntry, type Grant,
@@ -75,7 +82,13 @@ const NEXT: Tool = { name: 'game_next', description: 'Go on to the next map afte
 /** While visible, game_next names the map it goes to: a `definition` hint, without tools/list_changed. */
 const nextDefinition = (map: string): Tool => ({ ...NEXT, description: `Go on to the next map, ${map} (same game and skill).` });
 
-const SURFACE = { title: 'Archipelago Games', summary: 'Doom, Doom II, Freedoom and Heretic, turn by turn; people watch on the web and talk to you.' };
+const SURFACE = { title: 'Archipelago Games', summary: 'Doom, Doom II, Freedoom and Heretic turn by turn, with people watching on the web; and Go against a bot or another agent.' };
+const GAME_KEY = unitKey(TOOLSET);
+const toolsOf = (toolset: string): readonly string[] => (toolset === GO ? GO_TOOL_NAMES : GAME_TOOLS);
+
+/** An event for this connection's host: Doom's game ended elsewhere, or a Go opponent's move. */
+interface Explain { id: string; toolset: string; instance?: string; text: string; tags: string[] }
+let goEventSeq = 0;
 const STATUS_WORD: Record<GameStatus, string> = { running: 'playing', dead: 'dead', complete: 'level complete', stopped: 'stopped' };
 const OPTION_KEYS = ['game', 'map', 'skill', 'image', 'image_scale', 'keep'];
 /** How long a game that ended unseen is reported in toolsets/list `ended`. */
@@ -120,10 +133,12 @@ export class McplSession {
   private toolHints = false;
   /** One strictly increasing counter per connection for every hint change sent (RFC-014 §6.1). */
   private rev = 0;
-  /** What this host has been told about the game toolset (its state on the host, as far as we know). */
-  private told: Told = closedTold();
+  /** What this host has been told, per unit (`game`, and each Go instance): its state on the host, as far as we know. */
+  private told: Units = new Map();
   private peerTimer: NodeJS.Timeout | null = null;
-  private peerEnded: { id: string; text: string } | null = null;
+  /** Events from elsewhere waiting for the debounced flush, and suggestions to send with it. */
+  private pendingEvents: Explain[] = [];
+  private pendingSuggest: NonNullable<HintChanges['suggest']> = [];
 
   constructor(private app: App, private ws: WebSocket, readonly actor: Principal, private log: (m: string) => void) {}
 
@@ -139,7 +154,7 @@ export class McplSession {
     if (!this.pushReady()) return;
     if (session.owner.sub !== this.actor.sub) return;
     // RFC-014 §7: when a toolset closes, its events stop.
-    if (this.toolHints && !this.told.open) return;
+    if (this.toolHints && !this.told.has(GAME_KEY)) return;
     const now = Date.now();
     if (now - session.lastActiveAt < 20_000 || now - this.lastPushAt < 20_000) return;
     const unread = session.unread;
@@ -177,23 +192,35 @@ export class McplSession {
     return { id: s.id, status: s.status, parked: s.parked, map: s.map, title: titleOf(s), next: s.status === 'complete' ? nextMap(s.game, s.map, this.app.games.catalogue) : null };
   }
 
-  private toolDefs(): Tool[] { return this.toolHints ? [...TOOLS, RESTART, NEXT] : TOOLS; }
+  private toolDefs(): Tool[] { return this.toolHints ? [...TOOLS, RESTART, NEXT, ...GO_TOOLS] : TOOLS; }
 
-  /** Every tool, visible or not, with its hints; `mcpl/visible` on a toolset tool is "visible in the open toolset". */
+  /** Every unit open for this principal now: the Doom game (if open) and each Go instance. */
+  private units(): Units {
+    const u: Units = new Map();
+    const game = current(this.gameView());
+    if (game.open) u.set(GAME_KEY, game);
+    if (this.toolHints) for (const r of this.app.go.instances(this.actor.sub)) {
+      u.set(unitKey(GO, r.name), { open: true, title: this.app.go.title(r), visible: new Set(this.app.go.visible(r)), defs: new Map() });
+    }
+    return u;
+  }
+
+  /** Every tool, visible or not, with its hints; `mcpl/visible` on a toolset tool is "visible in at least one open unit". */
   private toolList(): Tool[] {
-    const now = current(this.gameView());
-    return this.toolDefs().map((t) => hinted(t, now.visible.has(t.name)));
+    const visible = new Set<string>();
+    for (const u of this.units().values()) for (const t of u.visible) visible.add(t);
+    return this.toolDefs().map((t) => hinted(t, visible.has(t.name), isGoTool(t.name) ? GO : undefined));
   }
 
   /**
    * A definition as a hint carries it (RFC-014 §6.1): only the description, schema and annotations
    * may differ from the listed one — the name and `_meta` (with any RFC-008 class) are the listed ones.
    */
-  private definition(name: string): Tool {
+  private definition(key: string, name: string): Tool {
     const g = this.gameView();
     const listed = this.toolDefs().find((t) => t.name === name)!;
-    const now = name === 'game_next' && g?.next ? nextDefinition(g.next) : listed;
-    const { 'mcpl/visible': _v, ...meta } = hinted(listed, true)._meta ?? {};
+    const now = key === GAME_KEY && name === 'game_next' && g?.next ? nextDefinition(g.next) : listed;
+    const { 'mcpl/visible': _v, ...meta } = hinted(listed, true, unitOf(key).toolset)._meta ?? {};
     return { name: listed.name, description: now.description, inputSchema: now.inputSchema, ...(now.annotations ? { annotations: now.annotations } : {}), _meta: meta };
   }
 
@@ -203,25 +230,31 @@ export class McplSession {
    * (1, 2, 3…) in the order they are written — so a rev is allocated only for changes that exist,
    * and every caller writes the message in the same synchronous step (no await in between).
    */
-  private changes(opts: { full?: boolean; mayOpen: boolean }): HintChanges | null {
-    const r = diff(this.told, current(this.gameView()), (t) => this.definition(t), opts);
+  private changes(opts: { full?: boolean | ReadonlySet<string>; mayOpen: boolean }, suggest?: HintChanges['suggest']): HintChanges | null {
+    const r = diffUnits(this.told, this.units(), toolsOf, (key, t) => this.definition(key, t), opts);
     this.told = r.told;
-    return r.changes ? { rev: ++this.rev, ...r.changes } : null;
+    return this.stamp(r.changes, suggest);
+  }
+
+  /** The next rev on a set of changes, or null if there are none. */
+  private stamp(c: Changes | null, suggest?: HintChanges['suggest']): HintChanges | null {
+    if (!c && !suggest?.length) return null;
+    return { rev: ++this.rev, ...(c ?? {}), ...(suggest?.length ? { suggest } : {}) };
   }
 
   private notifyHints(h: HintChanges) { this.send({ jsonrpc: '2.0', method: 'tools/hints', params: h }); }
 
   /**
-   * A change with an event that explains it rides that event; without pushes, it goes standalone.
-   * RFC-014 §6.1: a host applies a push's hints when it reads the push, whatever it decides about
-   * the event — so a refused or unanswered push needs nothing restated; the next change takes the
-   * next rev. A push carrying hints is never coalesced (§7).
+   * Push an event, with the hint changes it explains if any. RFC-014 §6.1: a host applies a push's
+   * hints when it reads the push, whatever it decides about the event — so a refused or unanswered
+   * push needs nothing restated; the next change takes the next rev. A push carrying hints is never
+   * coalesced (§7).
    */
-  private deliverHints(h: HintChanges, explain: { id: string; text: string; tags: string[] } | null) {
-    if (!explain || !this.pushReady()) { this.notifyHints(h); return; }
+  private pushEvent(e: Explain, h: HintChanges | null) {
     this.request('push/event', {
-      featureSet: FS_NAME, eventId: explain.id, timestamp: new Date().toISOString(), origin: { server: 'games' },
-      tags: explain.tags, toolset: TOOLSET, hints: h, payload: { content: [{ type: 'text', text: explain.text }] },
+      featureSet: FS_NAME, eventId: e.id, timestamp: new Date().toISOString(), origin: { server: 'games' },
+      tags: e.tags, toolset: e.toolset, ...(e.instance ? { instance: e.instance } : {}),
+      payload: { content: [{ type: 'text', text: e.text }] }, ...(h ? { hints: h } : {}),
     }).catch(() => undefined);
   }
 
@@ -233,30 +266,49 @@ export class McplSession {
   onGameState(change: StateChange) {
     if (!this.toolHints || !this.ready || this.closed) return;
     if (change.cause === this) return;
-    if (change.ended && this.told.open) {
+    if (change.ended && this.told.has(GAME_KEY)) {
       const s = change.ended.session;
       const byPeer = change.cause instanceof McplSession;
       const why = byPeer && change.ended.why === 'stopped by the player' ? 'it was stopped from another connection under your identity'
         : byPeer && change.ended.why === 'the game toolset was closed' ? 'it was closed from another connection under your identity'
         : byPeer && change.ended.why === 'replaced by a new game' ? 'a new game was started from another connection under your identity'
         : change.ended.why;
-      this.peerEnded = { id: `ended_${s.id}`, text: `[games] Your game ended (${why}): ${s.game} ${s.map}, turn ${s.turn}${s.status === 'stopped' ? '' : `, ${STATUS_WORD[s.status]}`}. game_results lists it; opening the game toolset starts a new one.` };
+      this.pendingEvents.push({ id: `ended_${s.id}`, toolset: TOOLSET, tags: ['games:ended', 'surface:done'],
+        text: `[games] Your game ended (${why}): ${s.game} ${s.map}, turn ${s.turn}${s.status === 'stopped' ? '' : `, ${STATUS_WORD[s.status]}`}. game_results lists it; opening the game toolset starts a new one.` });
     }
-    // Debounced: a burst (a game replaced: ended, then started) is reported as where it lands.
+    this.schedulePeer();
+  }
+
+  /**
+   * A Go operation changed this principal's instances (its own move on another connection, an
+   * opponent's move, a join, a rematch offer). The caller's connection reports it in its result.
+   */
+  onGoChange(change: GoChange) {
+    if (!this.toolHints || !this.ready || this.closed || change.cause === this) return;
+    for (const e of change.events) if (e.sub === this.actor.sub) this.pendingEvents.push(goExplain(e));
+    for (const sg of change.suggest) if (sg.sub === this.actor.sub) this.pendingSuggest.push({ toolset: GO, action: 'open', reason: sg.reason });
+    this.schedulePeer();
+  }
+
+  /** Debounced: a burst (a game replaced: ended, then started) is reported as where it lands. */
+  private schedulePeer() {
     if (!this.peerTimer) this.peerTimer = setTimeout(() => { this.peerTimer = null; this.flushPeer(); }, 25);
   }
 
+  /**
+   * RFC-014 §5.6: toolsets belong to the principal. An open, close or visibility change made on
+   * another connection (or by another player) reaches this one as ordinary hint changes, toolset
+   * state included — riding the last event that explains it, or standalone.
+   */
   private flushPeer() {
     if (this.closed) return;
-    const ended = this.peerEnded;
-    this.peerEnded = null;
-    // RFC-014 §5.6: toolsets belong to the principal. An open, close or visibility change made on
-    // another connection reaches this one as ordinary hint changes, toolset state included.
-    const h = this.changes({ mayOpen: true });
-    if (!h) return;
-    const closing = h.toolsets?.some((t) => t.state === 'closed') ?? false;
-    this.deliverHints(h, closing && ended ? { ...ended, tags: ['games:ended', 'surface:done'] } : null);
+    const events = this.pendingEvents.splice(0);
+    const h = this.changes({ mayOpen: true }, this.pendingSuggest.splice(0));
+    if (events.length && this.pushReady()) events.forEach((e, i) => this.pushEvent(e, i === events.length - 1 ? h : null));
+    else if (h) this.notifyHints(h);
   }
+
+  canTakeEvents(): boolean { return this.toolHints && this.pushReady(); }
 
   close() {
     if (this.closed) return;
@@ -289,7 +341,7 @@ export class McplSession {
           this.toolHints = this.mcpl && params.capabilities.experimental.mcpl.toolHints === true;
           if (!this.mcpl) { this.grant = { ...EMPTY_GRANT, patterns: ['tools'], paths: new Set(['tools' as const]) }; this.policyReady = true; }
           // RFC-014 §5.1/§6.3: toolHints, the toolset and the surface hint — declared to a host that advertised toolHints.
-          const hints = this.toolHints ? { toolHints: true, toolsets: { [TOOLSET]: toolsetDeclaration(this.app) }, surface: SURFACE } : {};
+          const hints = this.toolHints ? { toolHints: true, toolsets: { [TOOLSET]: toolsetDeclaration(this.app), [GO]: goDeclaration() }, surface: SURFACE } : {};
           this.result(m.id, {
             protocolVersion: typeof params.protocolVersion === 'string' ? params.protocolVersion : '2024-11-05',
             serverInfo: { name: 'archipelago-games', version: VERSION },
@@ -329,14 +381,17 @@ export class McplSession {
           // RFC-014 §4.1: a tool of a toolset that is not open, or not visible now, is an ordinary
           // tool error that says why. Only for a hinted host: a plain host keeps today's behaviour.
           const refused = this.toolHints && isGameTool(name) ? unavailable(name, this.gameView()) : null;
-          const r = refused !== null ? text(refused, true) : await this.tool(name, args).catch((e): ToolResult => {
+          const fails = (e: unknown): ToolResult => {
             if (e instanceof Fault) return text(e.message, true);
             this.log(`${this.actor.name}: ${name} failed: ${(e as Error).stack ?? e}`);
             return text(`${name} failed: ${(e as Error).message}`, true);
-          });
+          };
+          const r = refused !== null ? text(refused, true)
+            : this.toolHints && isGoTool(name) ? await this.goCall(name, args, params._meta).catch(fails)
+            : await this.tool(name, args).catch(fails);
           // What this call caused rides in its result, and is not pushed (RFC-014 §6.2). Calling a
           // toolset tool also confirms the toolset to a host that had not been told it was open.
-          const h = this.toolHints ? this.changes({ mayOpen: isGameTool(name) }) : null;
+          const h = this.toolHints ? this.changes({ mayOpen: isGameTool(name) || isGoTool(name) }) : null;
           this.result(m.id, h ? { ...r, _meta: { 'mcpl/hints': h } } : r);
           return;
         }
@@ -347,25 +402,37 @@ export class McplSession {
           if (!this.toolHints) { if (hasId) this.error(m.id, -32601, `Method not found: ${m.method}`); return; }
           if (!hasId) return;
           try {
-            const body = m.method === 'toolsets/open' ? await this.openGame(params) : m.method === 'toolsets/close' ? await this.closeGame(params) : {};
-            if (m.method === 'toolsets/list') {
-              // RFC-014 §5.3: what this identity holds open, and its hint state in full as of this
-              // result's rev (a tool not stated visible is invisible); the host replaces its state with it.
-              // And every end the host did not ask for with toolsets/close (game_stop, the web stop, the
-              // idle sweep, a dead engine), whoever was connected: `ended` records, each with an id, on
-              // every list until they expire; hosts tell their agent once per id.
+            if (m.method !== 'toolsets/list' && params.toolset !== TOOLSET && params.toolset !== GO) throw new RpcError(-32602, `No toolset "${String(params.toolset ?? '')}" here; there are "${TOOLSET}" (Doom) and "${GO}".`);
+            const go = params.toolset === GO;
+            let full: boolean | ReadonlySet<string> = true;
+            let body: Record<string, unknown> = {};
+            if (m.method === 'toolsets/open') {
+              body = go ? await this.openGo(params) : await this.openGame(params);
+              full = new Set([unitKey(go ? GO : TOOLSET, go ? String(body.instance) : undefined)]); // the unit it opened, in full
+            } else if (m.method === 'toolsets/close') {
+              body = go ? await this.closeGo(params) : await this.closeGame(params);
+            } else {
+              // RFC-014 §5.3: what this identity holds open — the Doom game and every Go instance — and
+              // their hint state in full as of this result's rev (a tool not stated visible is
+              // invisible); the host replaces its per-instance state with it. And every end the host did
+              // not ask for with toolsets/close, whoever was connected: `ended` records, each with an id,
+              // on every list until they expire; hosts tell their agent once per id.
               const g = this.gameView();
-              const b = body as Record<string, unknown>;
-              b.open = g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : [];
+              body.open = [
+                ...(g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : []),
+                ...this.app.go.instances(this.actor.sub).map((r) => ({ toolset: GO, instance: r.name, title: this.app.go.title(r) })),
+              ];
               const ended = this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS);
-              if (ended.length) b.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
-              this.told = closedTold();
+              if (ended.length) body.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
+              this.told = new Map();
             }
-            let h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full: true, mayOpen: true });
+            let h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full, mayOpen: true });
             // RFC-014 r6 §5.3: a toolsets/list result always carries its hints and takes a rev — with an
             // empty `tools` when nothing is open — so that an empty statement still clears stale state.
             if (!h && m.method === 'toolsets/list') h = { rev: ++this.rev, tools: [] };
             this.result(m.id, { ...body, ...(h ? { _meta: { 'mcpl/hints': h } } : {}) });
+            // Go events held while no connection of this principal could take them, now that the host has its baseline.
+            if (m.method === 'toolsets/list') for (const e of this.app.go.takeHeld(this.actor.sub)) { if (this.pushReady()) this.pushEvent(goExplain(e), null); else this.app.go.hold(e); }
           } catch (e) {
             if (e instanceof RpcError) this.error(m.id, e.code, e.message);
             else if (e instanceof Fault) this.error(m.id, e.status === 400 ? -32602 : -32000, e.message);
@@ -389,6 +456,7 @@ export class McplSession {
       'People can watch your game on the web and talk to you; their words appear under "Watchers say" and, when you are idle, as a games:chat push. Answer with the say field of game_act or game_say.',
       'Dying or finishing a level ends the episode: game_restart plays the map again, game_next goes on to the next map, game_start picks any map. Progress carries nothing over: you start each map with a pistol.',
       ACTION_HELP,
+      'Go is the `go` toolset: each open is one game, a named instance (options size 9/13/19, color, opponent bot or agent, level, komi; or join: a code from game_list to take the empty seat in another agent\'s game). Calls name the game in _meta["mcpl/instance"]. Against the bot its reply comes in your result; against an agent their moves arrive as events. Points are a column letter (A–T, no I) and a row counted from the bottom, e.g. D4. Two passes start scoring: go_mark_dead, then go_accept.',
     ].join('\n');
     return [
       'Archipelago Games: play Doom turn by turn. The world only moves while game_act runs, so take your time between turns.',
@@ -468,8 +536,43 @@ export class McplSession {
   }
 
   private checkToolset(params: Record<string, unknown>) {
-    if (params.toolset !== TOOLSET) throw new RpcError(-32602, `No toolset "${String(params.toolset ?? '')}" here; there is "${TOOLSET}".`);
+    if (params.toolset !== TOOLSET) throw new RpcError(-32602, `No toolset "${String(params.toolset ?? '')}" here; there are "${TOOLSET}" (Doom) and "${GO}".`);
     if (params.instance !== undefined) throw new RpcError(-32602, `The ${TOOLSET} toolset has no instances: one game per identity.`);
+  }
+
+  // ---------------------------------------------------------------- Go (the `go` toolset, named instances)
+
+  /** toolsets/open for Go: a new game, a seat in a waiting one ({join}), or — by a name that is open — adopting it. */
+  private async openGo(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (params.instance !== undefined && typeof params.instance !== 'string') throw new RpcError(-32602, 'instance must be a string.');
+    const o = (params.options ?? {}) as Record<string, unknown>;
+    if (typeof o !== 'object' || Array.isArray(o)) throw new RpcError(-32602, 'options must be an object.');
+    const r = await this.app.go.open(this.actor, params.instance as string | undefined, o, this);
+    return { toolset: GO, instance: r.ref.name, title: this.app.go.title(r.ref), content: [{ type: 'text', text: r.text }], ...(r.adopted ? { adopted: true } : {}) };
+  }
+
+  /** toolsets/close for Go: names the instance (or the only one open). */
+  private async closeGo(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const mine = this.app.go.instances(this.actor.sub);
+    const name = typeof params.instance === 'string' ? params.instance : mine.length === 1 ? mine[0]!.name : undefined;
+    if (name === undefined) throw new RpcError(-32602, mine.length ? `Several Go games are open (${mine.map((r) => r.name).join(', ')}); say which with instance.` : 'No Go game is open.');
+    return { content: [{ type: 'text', text: await this.app.go.close(this.actor, name, this) }] };
+  }
+
+  /** A Go tool call: the instance from `_meta["mcpl/instance"]`, or the only one open (RFC-014 §5.5). */
+  private async goCall(name: string, args: Record<string, unknown>, meta: unknown): Promise<ToolResult> {
+    const want = meta && typeof meta === 'object' && typeof (meta as Record<string, unknown>)['mcpl/instance'] === 'string' ? (meta as Record<string, string>)['mcpl/instance'] : undefined;
+    const mine = this.app.go.instances(this.actor.sub);
+    const ref: GoRef | undefined = want !== undefined ? mine.find((r) => r.name === want) : mine.length === 1 ? mine[0] : undefined;
+    if (!ref) {
+      if (!mine.length) return text(`${name} belongs to the go toolset, which is not open: you have no Go game. Opening the go toolset starts one.`, true);
+      if (want !== undefined) return text(`No open Go game "${want}"; open: ${mine.map((r) => r.name).join(', ')}.`, true);
+      return text(`Several Go games are open (${mine.map((r) => r.name).join(', ')}); say which with _meta["mcpl/instance"].`, true);
+    }
+    const why = this.app.go.unavailable(ref, name);
+    if (why) return text(why, true);
+    const out = await this.app.go.call(this.actor, ref, name, args, this);
+    return text(out.text, out.isError);
   }
 
   // ---------------------------------------------------------------- tools
@@ -508,6 +611,12 @@ export class McplSession {
         const kept = this.toolHints && mine?.parked ? ' Kept on the server; opening the game toolset picks it up.' : '';
         const begin = this.toolHints ? 'opening the game toolset starts one' : 'game_start begins one';
         lines.push(mine ? `Your game: ${mine.game} ${mine.map}, turn ${mine.turn}, ${mine.status}. Watch page: ${this.app.config.origin}/g/${mine.id}${kept}` : `You have no game running; ${begin}.`);
+        if (this.toolHints) {
+          const go = this.app.go;
+          const waiting = go.waiting().map((m) => go.describeWaiting(m));
+          const myGo = go.instances(me.sub).map((r) => `${r.name}: ${go.title(r)}`);
+          lines.push(`Go (the go toolset): 9×9, 13×13 or 19×19 against the bot or another agent. ${waiting.length ? `Waiting for an opponent — open go with {join: code}: ${waiting.join(' · ')}.` : 'No game is waiting for an opponent.'}${myGo.length ? ` Your Go games: ${myGo.join(' · ')}.` : ''}`);
+        }
         return text(lines.join('\n'));
       }
       case 'game_start': {
@@ -569,6 +678,7 @@ export class McplSession {
 }
 
 const titleOf = (s: GameSession) => `${s.game} ${s.map}, skill ${s.skill}`;
+const goExplain = (e: GoEvent): Explain => ({ id: `go_${++goEventSeq}_${Date.now().toString(36)}`, toolset: GO, instance: e.instance, text: `[go] ${e.text}`, tags: e.tags });
 
 /** toolsets/open options against the declared schema; game and map are checked by Games.start. */
 function optionsProblem(o: Record<string, unknown>): string | null {
@@ -590,6 +700,16 @@ export function attachMcpl(server: Server, app: App, log: (m: string) => void) {
   const open = new Map<WebSocket, McplSession>();
   app.games.on('chat', (session: GameSession) => { for (const s of open.values()) s.maybePushChat(session); });
   app.games.on('state', (sub: string, change: StateChange) => { for (const s of open.values()) if (s.actor.sub === sub) s.onGameState(change); });
+  // Go: every principal the operation touched hears of it; an event no connection of its principal
+  // can take is held for that principal's next toolsets/list.
+  app.go.on('change', (change: GoChange) => {
+    const subs = new Set([...change.subs, ...change.events.map((e) => e.sub), ...change.suggest.map((x) => x.sub)]);
+    for (const sub of subs) {
+      const live = [...open.values()].filter((s) => s.actor.sub === sub);
+      for (const s of live) s.onGoChange(change);
+      if (!live.some((s) => s.canTakeEvents()) && !live.includes(change.cause as McplSession)) for (const e of change.events) if (e.sub === sub) app.go.hold(e);
+    }
+  });
   server.on('upgrade', (req, socket, head) => {
     let url: URL;
     try { url = new URL(req.url ?? '/', 'http://games'); } catch { return; }

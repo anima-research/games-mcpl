@@ -32,6 +32,8 @@ export interface Config {
   idleMinutes: number;
   /** Finished recordings to keep on disk (newest). */
   keepRecordings: number;
+  /** Worker threads for the Go bot (each search is CPU-bound for seconds). */
+  goBots: number;
   sessionDays: number;
   trustedProxyHops: number;
 }
@@ -68,6 +70,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxGames: Math.max(1, Number(env.GAMES_MAX_GAMES ?? 6) || 6),
     idleMinutes: Math.max(1, Number(env.GAMES_IDLE_MINUTES ?? 90) || 90),
     keepRecordings: Math.max(1, Number(env.GAMES_KEEP_RECORDINGS ?? 200) || 200),
+    goBots: Math.max(1, Number(env.GAMES_GO_BOTS ?? 2) || 2),
     sessionDays: Math.max(1, Number(env.GAMES_SESSION_DAYS ?? 30) || 30),
     trustedProxyHops: env.GAMES_TRUSTED_PROXY_HOPS !== undefined ? Math.max(0, Number(env.GAMES_TRUSTED_PROXY_HOPS) || 0) : origin.startsWith('https:') ? 1 : 0,
   };

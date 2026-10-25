@@ -1,6 +1,7 @@
-// MCPL RFC-014 revision 2 (tool presence, toolsets and surfaces): which tools are static,
-// which belong to the `game` toolset, which are visible in each game state, and the
-// per-connection bookkeeping of what a host has been told. Pure — mcpl.ts owns the wire;
+// MCPL RFC-014 (tool presence, toolsets and surfaces): which tools are static, which belong to
+// the `game` toolset, which are visible in each game state, and the per-connection bookkeeping of
+// what a host has been told — per unit: a toolset without instances, or one named instance of a
+// toolset with them (src/go/toolset.ts has Go's). Pure — mcpl.ts owns the wire;
 // test/hints.test.ts covers it.
 //
 // The toolset is open for a principal while it has a game that was not closed with `keep`
@@ -16,12 +17,12 @@ export const TOOLSET = 'game';
 
 export interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; annotations?: Record<string, unknown>; _meta?: Record<string, unknown> }
 
-/** RFC §6.1, without the instance members (this toolset has no instances). */
+/** RFC §6.1. `instance` is present on entries for a toolset with instances. */
 export interface HintChanges {
   rev: number;
-  tools?: Array<{ name: string; visible?: boolean; definition?: Tool }>;
-  toolsets?: Array<{ toolset: string; state: 'open' | 'closed'; title?: string }>;
-  suggest?: Array<{ toolset: string; action: 'open' | 'close'; reason: string }>;
+  tools?: Array<{ name: string; instance?: string; visible?: boolean; definition?: Tool }>;
+  toolsets?: Array<{ toolset: string; instance?: string; state: 'open' | 'closed'; title?: string }>;
+  suggest?: Array<{ toolset: string; instance?: string; action: 'open' | 'close'; reason: string }>;
 }
 export type Changes = Omit<HintChanges, 'rev'>;
 
@@ -96,31 +97,71 @@ export function current(g: GameView | null): Told {
  * A close reports the tools that were visible as invisible, and the toolset closed.
  */
 export function diff(told: Told, cur: Told, define: (tool: string) => Tool, opts: { full?: boolean; mayOpen: boolean }): { changes: Changes | null; told: Told } {
+  return diffUnit(told, cur, { toolset: TOOLSET, tools: GAME_TOOLS }, define, opts);
+}
+
+/** One unit: a toolset without instances, or one instance of a toolset with them. */
+export interface Unit { toolset: string; instance?: string; tools: readonly string[] }
+
+export function diffUnit(told: Told, cur: Told, unit: Unit, define: (tool: string) => Tool, opts: { full?: boolean; mayOpen: boolean }): { changes: Changes | null; told: Told } {
   const tools: NonNullable<Changes['tools']> = [];
   const toolsets: NonNullable<Changes['toolsets']> = [];
+  const inst = unit.instance !== undefined ? { instance: unit.instance } : {};
   if (!cur.open) {
     if (!told.open) return { changes: null, told };
-    for (const name of GAME_TOOLS) if (told.visible.has(name)) tools.push({ name, visible: false });
-    toolsets.push({ toolset: TOOLSET, state: 'closed' });
+    for (const name of unit.tools) if (told.visible.has(name)) tools.push({ name, ...inst, visible: false });
+    toolsets.push({ toolset: unit.toolset, ...inst, state: 'closed' });
     return { changes: { tools, toolsets }, told: closedTold() };
   }
   if (!told.open && !opts.mayOpen) return { changes: null, told };
   const fresh = opts.full || !told.open;
-  for (const name of GAME_TOOLS) {
+  for (const name of unit.tools) {
     const v = cur.visible.has(name);
     const key = cur.defs.get(name);
     const defChanged = v && key !== undefined && (fresh || told.defs.get(name) !== key);
-    if (fresh || v !== told.visible.has(name) || defChanged) tools.push({ name, visible: v, ...(defChanged ? { definition: define(name) } : {}) });
+    if (fresh || v !== told.visible.has(name) || defChanged) tools.push({ name, ...inst, visible: v, ...(defChanged ? { definition: define(name) } : {}) });
   }
-  if (fresh || cur.title !== told.title) toolsets.push({ toolset: TOOLSET, state: 'open', title: cur.title });
+  if (fresh || cur.title !== told.title) toolsets.push({ toolset: unit.toolset, ...inst, state: 'open', title: cur.title });
   const changes = tools.length || toolsets.length ? { ...(tools.length ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}) } : null;
   return { changes, told: { open: true, title: cur.title, visible: new Set(cur.visible), defs: new Map(cur.defs) } };
 }
 
-/** A tool definition with its hints (`mcpl/visible` only on toolset tools: a static tool is always visible). */
-export function hinted(tool: Tool, visible: boolean): Tool {
-  const meta = isGameTool(tool.name)
-    ? { 'mcpl/presence': 'dynamic', 'mcpl/toolset': TOOLSET, 'mcpl/visible': visible }
+/** Units by key; a unit absent from the map is closed. */
+export type Units = Map<string, Told>;
+export const unitKey = (toolset: string, instance?: string) => `${toolset}\u0000${instance ?? ''}`;
+export function unitOf(key: string): { toolset: string; instance?: string } {
+  const [toolset, instance] = key.split('\u0000');
+  return { toolset: toolset!, ...(instance ? { instance } : {}) };
+}
+
+/**
+ * diffUnit over every unit the host was told of or that is open now. `full`: true for all units,
+ * or the keys to restate in full (an open restates the unit it opened).
+ */
+export function diffUnits(told: Units, cur: Units, toolsOf: (toolset: string) => readonly string[], define: (key: string, tool: string) => Tool,
+  opts: { full?: boolean | ReadonlySet<string>; mayOpen: boolean }): { changes: Changes | null; told: Units } {
+  const tools: NonNullable<Changes['tools']> = [];
+  const toolsets: NonNullable<Changes['toolsets']> = [];
+  const next: Units = new Map();
+  for (const key of new Set([...told.keys(), ...cur.keys()])) {
+    const u = unitOf(key);
+    const full = opts.full === true || (opts.full instanceof Set && opts.full.has(key));
+    const r = diffUnit(told.get(key) ?? closedTold(), cur.get(key) ?? closedTold(), { ...u, tools: toolsOf(u.toolset) }, (t) => define(key, t), { full, mayOpen: opts.mayOpen });
+    if (r.told.open) next.set(key, r.told);
+    if (r.changes?.tools) tools.push(...r.changes.tools);
+    if (r.changes?.toolsets) toolsets.push(...r.changes.toolsets);
+  }
+  const changes = tools.length || toolsets.length ? { ...(tools.length ? { tools } : {}), ...(toolsets.length ? { toolsets } : {}) } : null;
+  return { changes, told: next };
+}
+
+/**
+ * A tool definition with its hints (`mcpl/visible` only on toolset tools: a static tool is always
+ * visible). `toolset`: the toolset it belongs to, if any (default: `game` for the game tools).
+ */
+export function hinted(tool: Tool, visible: boolean, toolset: string | null = isGameTool(tool.name) ? TOOLSET : null): Tool {
+  const meta = toolset
+    ? { 'mcpl/presence': 'dynamic', 'mcpl/toolset': toolset, 'mcpl/visible': visible }
     : { 'mcpl/presence': 'static' };
   return { ...tool, _meta: { ...tool._meta, ...meta } };
 }
