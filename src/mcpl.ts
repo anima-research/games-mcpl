@@ -79,7 +79,7 @@ const SURFACE = { title: 'Archipelago Games', summary: 'Doom, Doom II, Freedoom 
 const STATUS_WORD: Record<GameStatus, string> = { running: 'playing', dead: 'dead', complete: 'level complete', stopped: 'stopped' };
 const OPTION_KEYS = ['game', 'map', 'skill', 'image', 'image_scale', 'keep'];
 /** How long a game that ended unseen is reported in toolsets/list `ended`. */
-const ENDED_WINDOW_MS = 24 * 3600_000;
+const ENDED_WINDOW_MS = 3600_000;
 
 /** The `game` toolset as declared in the manifest (RFC-014 §5.1). */
 function toolsetDeclaration(app: App) {
@@ -187,9 +187,16 @@ export class McplSession {
     return this.toolDefs().map((t) => hinted(t, now.visible.has(t.name)));
   }
 
+  /**
+   * A definition as a hint carries it (RFC-014 §6.1): only the description, schema and annotations
+   * may differ from the listed one — the name and `_meta` (with any RFC-008 class) are the listed ones.
+   */
   private definition(name: string): Tool {
     const g = this.gameView();
-    return hinted(name === 'game_next' && g?.next ? nextDefinition(g.next) : this.toolDefs().find((t) => t.name === name)!, true);
+    const listed = this.toolDefs().find((t) => t.name === name)!;
+    const now = name === 'game_next' && g?.next ? nextDefinition(g.next) : listed;
+    const { 'mcpl/visible': _v, ...meta } = hinted(listed, true)._meta ?? {};
+    return { name: listed.name, description: now.description, inputSchema: now.inputSchema, ...(now.annotations ? { annotations: now.annotations } : {}), _meta: meta };
   }
 
   /**
@@ -212,15 +219,14 @@ export class McplSession {
       featureSet: FS_NAME, eventId: explain.id, timestamp: new Date().toISOString(), origin: { server: 'games' },
       tags: explain.tags, toolset: TOOLSET, hints: h, payload: { content: [{ type: 'text', text: explain.text }] },
     }).then((r) => {
-      // Refused or unanswered: the host did not apply its hints (RFC-014 §6.1). Re-send them with the
-      // same rev — unless a later rev has gone out meanwhile, when the same rev would arrive out of
-      // order: then send the whole state again as a new change.
+      // Refused or unanswered: the host did not apply its hints (RFC-014 §6.1). Restate the current
+      // state under a new rev, standalone — never the old rev, which later changes may have passed.
       if (r !== null && (r as { accepted?: unknown }).accepted !== false) return;
-      if (this.rev === h.rev) this.notifyHints(h); else this.resync();
+      this.resync();
     }).catch(() => undefined);
   }
 
-  /** The host missed a change: tell it the toolset's whole state again, under a new rev. */
+  /** The host missed a change: restate the toolset's whole state, under a new rev. */
   private resync() {
     const cur = current(this.gameView());
     this.told = cur.open ? closedTold() : { open: true, visible: new Set(GAME_TOOLS), defs: new Map() };
@@ -433,8 +439,10 @@ export class McplSession {
       }
     }
     let lead: string;
+    let adopted = false;
     if (session && obs) {
       const parked = session.parked;
+      adopted = !parked; // a kept (parked) game's toolset was closed: picking it up is a real open
       if (parked) games.setToolset(session, { parked: false, ...(typeof o.keep === 'boolean' ? { keep: o.keep } : {}) }, this);
       const differs = [
         typeof o.game === 'string' && o.game.toLowerCase() !== session.game ? 'game' : '',
@@ -450,7 +458,8 @@ export class McplSession {
       if (o.keep === true) games.setToolset(session, { keep: true }, this);
       lead = `Your game is live; people can watch at ${this.app.config.origin}/g/${session.id}`;
     }
-    return { toolset: TOOLSET, title: titleOf(session), content: this.observation(session, obs, lead).content };
+    // RFC-014 §5.2: an open that finds the game already open adopts it, and says so.
+    return { toolset: TOOLSET, title: titleOf(session), content: this.observation(session, obs, lead).content, ...(adopted ? { adopted: true } : {}) };
   }
 
   /** toolsets/close: end the game — or, if it was opened with keep, leave it running and closed. */

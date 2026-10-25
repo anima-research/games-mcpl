@@ -14,7 +14,7 @@ import type { GameStatus } from './games.js';
 
 export const TOOLSET = 'game';
 
-export interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; _meta?: Record<string, unknown> }
+export interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; annotations?: Record<string, unknown>; _meta?: Record<string, unknown> }
 
 /** RFC §6.1, without the instance members (this toolset has no instances). */
 export interface HintChanges {

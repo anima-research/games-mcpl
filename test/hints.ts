@@ -5,7 +5,10 @@
 // server (like test/resume.ts) and checks the conformance vectors of RFC-014 §13 that apply to a
 // server: 1 (full list), 2 (call results carry hints, no push for them), 4 (rev order),
 // 7 (a definition change without tools/list_changed), 8 (no hints to a host without toolHints),
-// 9 (toolsets/list after a reconnect adopts the running game). A second server, on a scripted
+// 9 (toolsets/list after a reconnect adopts the running game), 11 (a refused push is restated
+// under a new rev), 12 (toolsets/list restates a current definition), 13 (`ended`), 14 (another
+// connection hears of an open as a state change), 16 (close results carry hints), 18 (`adopted`),
+// 19 (no `coalesce` on a push carrying hints). A second server, on a scripted
 // sidecar (test/fake_sidecar.py) that finishes a level on cue, covers level complete: game_next
 // appears with a definition naming its map (vector 7) and goes away after the last map; a game
 // ended from outside MCPL (the web viewer's stop, like the idle sweep) is pushed with its reason
@@ -45,6 +48,8 @@ type Msg = Record<string, any>;
 class Host {
   ws!: WebSocket; id = 1; pending = new Map<number, (v: Msg) => void>();
   wire: Msg[] = [];
+  /** Answer pushes with accepted:false (a host whose policy refuses them). */
+  refuse = false;
   constructor(readonly label: string, private token: string, private toolHints: boolean) {}
   connect() {
     return new Promise<void>((res, rej) => {
@@ -53,7 +58,7 @@ class Host {
       this.ws.on('message', (d) => {
         const m = JSON.parse(d.toString());
         this.wire.push(m);
-        if (m.method === 'push/event') { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { accepted: true } })); return; }
+        if (m.method === 'push/event') { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { accepted: !this.refuse } })); return; }
         const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); p(m); }
       });
     });
@@ -112,6 +117,10 @@ async function scripted() {
   assert.equal(next.visible, true);
   assert.equal(next.definition.description, 'Go on to the next map, E2M1 (same game and skill).');
   assert.equal(next.definition._meta['mcpl/toolset'], 'game');
+  assert.equal(next.definition.name, 'game_next'); assert.equal(next.definition._meta['mcpl/visible'], undefined, 'a definition changes description and schema only');
+  // vector 12: toolsets/list (the recovery read) restates the current definition
+  const rl = (await h.call('toolsets/list')).result;
+  assert.equal(hintsOf(rl)!.tools.find((t: Msg) => t.name === 'game_next').definition.description, 'Go on to the next map, E2M1 (same game and skill).');
   const listed = ((await h.call('tools/list')).result.tools as Msg[]).find((t) => t.name === 'game_next')!;
   assert.equal(listed._meta['mcpl/visible'], true);
   assert.match(listed.description, /after finishing a level/, 'tools/list keeps the declared definition');
@@ -139,6 +148,18 @@ async function scripted() {
   const ev = await waitFor('the web stop pushed', () => h.wire.slice(mark).find((m) => m.method === 'push/event' && m.params?.hints));
   assert.match(ev.params.payload.content[0].text, /Your game ended \(stopped by Hints Tester\)/);
   assert.deepEqual(ev.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  // vector 11: a host that refuses the push gets the state restated standalone, under a higher rev
+  const o2 = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  const id2 = /\/g\/(g[0-9a-f]+)/.exec(textOf(o2))![1];
+  h.refuse = true;
+  const mark2 = h.wire.length;
+  assert.equal((await post(`/api/games/${id2}/stop`, {}, { Authorization: `Bearer ${tok.token}` })).status, 200);
+  const refused = await waitFor('the refused push', () => h.wire.slice(mark2).find((m) => m.method === 'push/event' && m.params?.hints));
+  const restated = await waitFor('the restatement', () => h.wire.slice(mark2).find((m) => m.method === 'tools/hints'));
+  show('refused push, then restated standalone', { push: refused.params.hints, restated: restated.params });
+  assert.ok(restated.params.rev > refused.params.hints.rev, 'a new rev, never the old one');
+  assert.deepEqual(restated.params.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  h.refuse = false;
   // §5.3 `ended`: a game that ends while no hinted connection has it open is reported by toolsets/list,
   // once per connection; one this connection heard of as it happened is not
   const told = new Host('told', tok.token, true); await told.connect(); await told.init();
@@ -160,6 +181,7 @@ async function scripted() {
   assert.equal((await fresh.call('toolsets/list')).result.ended, undefined, 'not while a newer game is there');
   await later.call('toolsets/close', { toolset: 'game' });
   for (const host of [h, told, later, other, fresh]) {
+    assert.ok(!host.wire.some((m) => m.method === 'push/event' && m.params?.hints && m.params?.coalesce), 'vector 19');
     const revs = host.hints().map((x) => x.h.rev);
     for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
   }
@@ -244,6 +266,7 @@ async function run() {
   // re-opening what is open adopts it and changes nothing
   const again = (await h1b.call('toolsets/open', { toolset: 'game', options: { map: 'MAP07', image: 'none' } })).result;
   assert.match(textOf(again), /You already have a game; this is it/); assert.match(textOf(again), /Not applied \(map\)/);
+  assert.equal(again.adopted, true, 'vector 18'); assert.equal(open.adopted, undefined);
   assert.ok(textOf(again).includes(`/g/${gameId}`));
 
   // vector 8: a plain host under the same identity — today's behaviour, never any hints
@@ -316,6 +339,7 @@ async function run() {
   assert.match(textOf(await h1b.tool('game_list')), /Kept on the server/);
   const back = (await h1b.call('toolsets/open', { toolset: 'game', options: { keep: false, image: 'none' } })).result;
   assert.match(textOf(back), /Picked up the game you kept/); assert.match(textOf(back), /turn 1/);
+  assert.equal(back.adopted, undefined, 'a kept game\'s toolset was closed: picking it up is a real open');
   await sleep(100);
   assert.match(textOf((await h1b.call('toolsets/close', { toolset: 'game' })).result), /Stopped your game/);
   await sleep(100);
@@ -326,6 +350,7 @@ async function run() {
 
   // vector 4: on every connection, revs strictly increase in wire order
   for (const host of [h1, h1b, h2, plain]) {
+    assert.ok(!host.wire.some((m) => m.method === 'push/event' && m.params?.hints && m.params?.coalesce), 'vector 19');
     const revs = host.hints().map((x) => x.h.rev);
     for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
     console.log(`${host.label}: ${revs.length} hint changes, revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ') || 'none'})`);
