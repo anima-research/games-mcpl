@@ -1,0 +1,291 @@
+// MCPL RFC-014 (tool presence, toolsets and surfaces) against the real engine: a scripted host
+// that advertises toolHints opens the game toolset, plays until it dies, restarts, reconnects and
+// adopts its game, sees changes made elsewhere arrive as pushes, closes with and without `keep`;
+// a plain host under the same identity sees today's behaviour throughout. Starts its own dev
+// server (like test/resume.ts) and checks the conformance vectors of RFC-014 §13 that apply to a
+// server: 1 (full list), 2 (call results carry hints, no push for them), 4 (rev order),
+// 7 (a definition change without tools/list_changed), 8 (no hints to a host without toolHints),
+// 9 (toolsets/list after a reconnect adopts the running game). A second server, on a scripted
+// sidecar (test/fake_sidecar.py) that finishes a level on cue, covers level complete: game_next
+// appears with a definition naming its map (vector 7) and goes away after the last map, and a
+// game ended from outside MCPL (the web viewer's stop, like the idle sweep) is pushed with its reason.
+//   npm run build && node --import tsx test/hints.ts
+import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import WebSocket from 'ws';
+import assert from 'node:assert/strict';
+
+const PORT = Number(process.env.HINTS_TEST_PORT ?? 7396);
+let base = `http://localhost:${PORT}`;
+
+function startServer(port: number, extra: Record<string, string> = {}): Promise<ChildProcess> {
+  base = `http://localhost:${port}`;
+  const dataDir = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'games-hints-'));
+  const env = { ...process.env, GAMES_DEV_ISSUER: 'dev.local', GAMES_ISSUERS: '', PORT: String(port), GAMES_DATA_DIR: dataDir, ...extra };
+  return new Promise((resolve, reject) => {
+    const p = spawn('node', ['dist/src/index.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d.toString(); if (/listening on/.test(out)) resolve(p); });
+    p.stderr.on('data', (d) => { out += d.toString(); });
+    p.on('exit', (c) => { if (!/listening on/.test(out)) reject(new Error(`server exited ${c}: ${out.slice(-400)}`)); });
+  });
+}
+const stopServer = (p: ChildProcess) => new Promise<void>((r) => { if (p.exitCode !== null) { r(); return; } p.on('exit', () => r()); p.kill('SIGTERM'); });
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const post = async (path: string, body: unknown, headers: Record<string, string> = {}) => {
+  const r = await fetch(base + path, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base, ...headers }, body: JSON.stringify(body) });
+  return { status: r.status, data: await r.json().catch(() => ({})) };
+};
+
+type Msg = Record<string, any>;
+/** A small host: records everything the server sends, in wire order, and accepts pushes. */
+class Host {
+  ws!: WebSocket; id = 1; pending = new Map<number, (v: Msg) => void>();
+  wire: Msg[] = [];
+  constructor(readonly label: string, private token: string, private toolHints: boolean) {}
+  connect() {
+    return new Promise<void>((res, rej) => {
+      this.ws = new WebSocket(`${base.replace('http', 'ws')}/mcpl?token=${encodeURIComponent(this.token)}`);
+      this.ws.on('open', () => res()); this.ws.on('error', rej);
+      this.ws.on('message', (d) => {
+        const m = JSON.parse(d.toString());
+        this.wire.push(m);
+        if (m.method === 'push/event') { this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { accepted: true } })); return; }
+        const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); p(m); }
+      });
+    });
+  }
+  call(method: string, params: unknown = {}) { const id = this.id++; return new Promise<Msg>((res) => { this.pending.set(id, res); this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }); }
+  async init() {
+    const mcpl = { version: '0.5', ...(this.toolHints ? { toolHints: true } : {}) };
+    const r = await this.call('initialize', { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl } }, clientInfo: { name: `hints-${this.label}`, version: '0' } });
+    this.ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
+    await this.call('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabledFeatureSets: ['*'] });
+    return r.result;
+  }
+  async tool(name: string, args: unknown = {}) { const r = await this.call('tools/call', { name, arguments: args }); if (r.error) throw new Error(`${name}: ${r.error.message}`); return r.result; }
+  /** Hint changes in the order they arrived: results' _meta, pushes' `hints`, tools/hints. */
+  hints(): Array<{ via: string; h: Msg }> {
+    const out: Array<{ via: string; h: Msg }> = [];
+    for (const m of this.wire) {
+      if (m.result?._meta?.['mcpl/hints']) out.push({ via: 'result', h: m.result._meta['mcpl/hints'] });
+      else if (m.method === 'push/event' && m.params?.hints) out.push({ via: 'push', h: m.params.hints });
+      else if (m.method === 'tools/hints') out.push({ via: 'tools/hints', h: m.params });
+    }
+    return out;
+  }
+  /** Unsolicited hint traffic (pushes with hints, tools/hints) after wire index `from`. */
+  unsolicited(from: number) { return this.wire.slice(from).filter((m) => m.method === 'tools/hints' || (m.method === 'push/event' && m.params?.hints)); }
+  close() { this.ws.close(); }
+}
+
+const textOf = (r: Msg) => (r.content ?? []).filter((b: Msg) => b.type === 'text').map((b: Msg) => b.text).join('\n') as string;
+const hintsOf = (r: Msg) => r._meta?.['mcpl/hints'] as Msg | undefined;
+const vis = (h: Msg | undefined) => Object.fromEntries((h?.tools ?? []).map((t: Msg) => [t.name, t.visible]));
+const listVis = (tools: Msg[]) => Object.fromEntries(tools.map((t) => [t.name, t._meta?.['mcpl/visible']]));
+async function waitFor<T>(what: string, f: () => T | undefined | false, ms = 3000): Promise<T> {
+  const until = Date.now() + ms;
+  for (;;) { const v = f(); if (v) return v; if (Date.now() > until) throw new Error(`timed out waiting for ${what}`); await sleep(25); }
+}
+const show = (label: string, v: unknown) => console.log(`--- ${label}\n${JSON.stringify(v, (k, x) => (k === 'data' && typeof x === 'string' ? `<${x.length} b64>` : x), 1).slice(0, 1600)}`);
+
+async function main() {
+  let server = await startServer(PORT);
+  try { await run(); } finally { await stopServer(server); }
+  server = await startServer(PORT + 1, { GAMES_SIDECAR: join(process.cwd(), 'test', 'fake_sidecar.py') });
+  try { await scripted(); } finally { await stopServer(server); }
+  console.log('\nHINTS OK');
+}
+
+/** On the scripted sidecar: level complete, game_next and its per-map definition (vector 7); an end from outside MCPL. */
+async function scripted() {
+  const { data: tok } = await post('/dev/token', { name: 'Hints Tester', kind: 'agent' });
+  const h = new Host('fake', tok.token, true); await h.connect(); await h.init();
+  await h.call('toolsets/open', { toolset: 'game', options: { map: 'E1M8', image: 'none' } });
+  let r = await h.tool('game_act', { actions: [{ use: true }], image: 'none' });
+  show('level complete: result _meta', r._meta);
+  assert.match(textOf(r), /game_next goes on to E2M1/);
+  const next = hintsOf(r)!.tools.find((t: Msg) => t.name === 'game_next');
+  assert.equal(next.visible, true);
+  assert.equal(next.definition.description, 'Go on to the next map, E2M1 (same game and skill).');
+  assert.equal(next.definition._meta['mcpl/toolset'], 'game');
+  const listed = ((await h.call('tools/list')).result.tools as Msg[]).find((t) => t.name === 'game_next')!;
+  assert.equal(listed._meta['mcpl/visible'], true);
+  assert.match(listed.description, /after finishing a level/, 'tools/list keeps the declared definition');
+  r = await h.tool('game_next', { image: 'none' });
+  assert.match(textOf(r), /On to E2M1/);
+  assert.deepEqual(hintsOf(r)!.toolsets, [{ toolset: 'game', state: 'open', title: 'freedoom1 E2M1, skill 3' }]);
+  assert.deepEqual(vis(hintsOf(r)), { game_act: true, game_start: false, game_restart: false, game_next: false });
+  // finishing E2M1 names E2M2: a new definition, not a repeat
+  r = await h.tool('game_act', { actions: [{ use: true }], image: 'none' });
+  assert.equal(hintsOf(r)!.tools.find((t: Msg) => t.name === 'game_next').definition.description, 'Go on to the next map, E2M2 (same game and skill).');
+  // the last map: no game_next
+  r = await h.tool('game_start', { map: 'E4M8', image: 'none' });
+  assert.equal(vis(hintsOf(r)).game_next, false);
+  r = await h.tool('game_act', { actions: [{ use: true }], image: 'none' });
+  assert.match(textOf(r), /That was the last map/);
+  assert.equal(vis(hintsOf(r)).game_next, undefined, 'game_next stays invisible');
+  r = await h.tool('game_next', {});
+  assert.ok(r.isError && /E4M8 was the last map/.test(textOf(r)));
+  await h.call('toolsets/close', { toolset: 'game' });
+  // ended from outside MCPL (the web viewer's stop; the idle sweep takes the same path): pushed with its reason
+  const o = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  const id = /\/g\/(g[0-9a-f]+)/.exec(textOf(o))![1];
+  const mark = h.wire.length;
+  assert.equal((await post(`/api/games/${id}/stop`, {}, { Authorization: `Bearer ${tok.token}` })).status, 200);
+  const ev = await waitFor('the web stop pushed', () => h.wire.slice(mark).find((m) => m.method === 'push/event' && m.params?.hints));
+  assert.match(ev.params.payload.content[0].text, /Your game ended \(stopped by Hints Tester\)/);
+  assert.deepEqual(ev.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  const revs = h.hints().map((x) => x.h.rev);
+  assert.deepEqual(revs, [...revs].sort((a, b) => a - b));
+  h.close();
+}
+
+async function run() {
+  const { data: tok } = await post('/dev/token', { name: 'Hints Tester', kind: 'agent' });
+
+  // ── a host that advertises toolHints ──
+  const h1 = new Host('h1', tok.token, true); await h1.connect();
+  const init = await h1.init();
+  const caps = init.capabilities.experimental.mcpl;
+  assert.equal(caps.toolHints, true);
+  assert.equal(caps.toolsets.game.default, 'closed');
+  assert.equal(caps.toolsets.game.instances, false);
+  assert.ok(caps.toolsets.game.options.properties.keep && caps.surface.title);
+  show('toolset declaration (initialize result)', { toolHints: caps.toolHints, toolsets: caps.toolsets, surface: caps.surface });
+
+  // vector 1: every tool, visible or not; static vs the toolset
+  let tools = (await h1.call('tools/list')).result.tools as Msg[];
+  assert.equal(tools.length, 11);
+  assert.ok(tools.every((t) => t._meta?.['mcpl/presence']));
+  assert.deepEqual(tools.filter((t) => t._meta['mcpl/presence'] === 'static').map((t) => t.name).sort(), ['game_list', 'game_results']);
+  assert.ok(tools.filter((t) => t._meta['mcpl/toolset'] === 'game').every((t) => t._meta['mcpl/visible'] === false), 'lobby: nothing in the toolset is visible');
+  assert.deepEqual((await h1.call('toolsets/list')).result, { open: [] });
+  let r = await h1.tool('game_act', { actions: [{ wait: 1 }] });
+  assert.ok(r.isError && /not open: you have no game/.test(textOf(r)), 'a closed toolset refuses its tools');
+  assert.equal((await h1.call('toolsets/open', { toolset: 'chess' })).error?.code, -32602);
+  assert.equal((await h1.call('toolsets/open', { toolset: 'game', instance: 'x' })).error?.code, -32602);
+  assert.equal((await h1.call('toolsets/open', { toolset: 'game', options: { skill: 9 } })).error?.code, -32602);
+  assert.equal((await h1.call('toolsets/open', { toolset: 'game', options: { game: 'tetris' } })).error?.code, -32602);
+
+  // open: starts a game; the result carries content and the full hint state
+  const open = (await h1.call('toolsets/open', { toolset: 'game', options: { game: 'freedoom2', map: 'MAP01', skill: 5, image: 'none' } })).result;
+  show('toolsets/open result', open);
+  assert.equal(open.toolset, 'game'); assert.equal(open.title, 'freedoom2 MAP01, skill 5');
+  assert.match(textOf(open), /Your game is live/);
+  const gameId = /\/g\/(g[0-9a-f]+)/.exec(textOf(open))![1];
+  let h = hintsOf(open)!;
+  assert.deepEqual(h.toolsets, [{ toolset: 'game', state: 'open', title: 'freedoom2 MAP01, skill 5' }]);
+  assert.equal(h.tools.length, 9, 'every toolset tool, visible or not');
+  assert.equal(vis(h).game_act, true); assert.equal(vis(h).game_restart, false);
+  tools = (await h1.call('tools/list')).result.tools;
+  assert.equal(listVis(tools).game_act, true); assert.equal(listVis(tools).game_restart, false);
+  r = await h1.tool('game_restart', {});
+  assert.ok(r.isError && /not available right now: you are playing MAP01/.test(textOf(r)));
+
+  // vector 2: play until dead — the death rides in that call's result, and nothing is pushed for it
+  let died: Msg | null = null; let mark = 0;
+  for (let i = 0; i < 60 && !died; i++) {
+    mark = h1.wire.length;
+    r = await h1.tool('game_act', { actions: i % 2 ? [{ wait: 350 }] : [{ attack: 1 }, { explore: true }], stop_on: ['dead'], image: 'none' });
+    if (/YOU DIED/.test(textOf(r))) died = r; else assert.equal(hintsOf(r), undefined, 'no changes while playing on');
+  }
+  assert.ok(died, 'expected to die on Nightmare within 60 turns');
+  show('the call that died: result _meta', died._meta);
+  assert.match(textOf(died), /game_restart tries the map again/);
+  assert.deepEqual(vis(hintsOf(died)), { game_act: false, game_start: true, game_restart: true });
+  await sleep(400);
+  assert.deepEqual(h1.unsolicited(mark), [], 'no push or tools/hints for a call\'s own consequences');
+  r = await h1.tool('game_act', { actions: [{ wait: 1 }] });
+  assert.ok(r.isError && /you died on MAP01/.test(textOf(r)));
+
+  r = await h1.tool('game_restart', { image: 'none' });
+  assert.match(textOf(r), /MAP01 again/);
+  assert.deepEqual(vis(hintsOf(r)), { game_act: true, game_start: false, game_restart: false });
+  r = await h1.tool('game_act', { actions: [{ turn: 10 }], image: 'none' });
+  const turnBefore = Number(/turn (\d+)/.exec(textOf(r))![1]);
+
+  // vector 9: a reconnect adopts the running game through toolsets/list
+  h1.close(); await sleep(200);
+  const h1b = new Host('h1b', tok.token, true); await h1b.connect(); await h1b.init();
+  const list = (await h1b.call('toolsets/list')).result;
+  show('toolsets/list after reconnect', list);
+  assert.deepEqual(list.open, [{ toolset: 'game', title: 'freedoom2 MAP01, skill 5' }]);
+  assert.equal(vis(hintsOf(list)).game_act, true);
+  r = await h1b.tool('game_act', { actions: [{ turn: -10 }], image: 'none' });
+  assert.equal(Number(/turn (\d+)/.exec(textOf(r))![1]), turnBefore + 1, 'the same game continues');
+  // re-opening what is open adopts it and changes nothing
+  const again = (await h1b.call('toolsets/open', { toolset: 'game', options: { map: 'MAP07', image: 'none' } })).result;
+  assert.match(textOf(again), /You already have a game; this is it/); assert.match(textOf(again), /Not applied \(map\)/);
+  assert.ok(textOf(again).includes(`/g/${gameId}`));
+
+  // vector 8: a plain host under the same identity — today's behaviour, never any hints
+  const plain = new Host('plain', tok.token, false); await plain.connect();
+  const pInit = await plain.init();
+  assert.equal(pInit.capabilities.experimental.mcpl.toolHints, undefined);
+  assert.equal(pInit.capabilities.experimental.mcpl.toolsets, undefined);
+  const pTools = (await plain.call('tools/list')).result.tools as Msg[];
+  assert.deepEqual(pTools.map((t) => t.name), ['game_list', 'game_start', 'game_act', 'game_look', 'game_state', 'game_say', 'game_watchers', 'game_stop', 'game_results']);
+  assert.equal((await plain.call('toolsets/list')).error?.code, -32601);
+  r = await plain.tool('game_state');
+  assert.ok(!r.isError && !r._meta, 'not gated, no hints');
+  r = await plain.tool('game_restart');
+  assert.ok(r.isError && /Unknown tool/.test(textOf(r)));
+
+  // a second hinted host adopts too; then the plain host stops the game: both hinted hosts are
+  // told with a push that explains it (it is not their call), the plain host with nothing
+  const h2 = new Host('h2', tok.token, true); await h2.connect(); await h2.init();
+  assert.equal((await h2.call('toolsets/list')).result.open.length, 1);
+  const m1 = h1b.wire.length; const m2 = h2.wire.length;
+  r = await plain.tool('game_stop');
+  assert.ok(!r._meta);
+  const ended = await waitFor('the end pushed to h1b', () => h1b.wire.slice(m1).find((m) => m.method === 'push/event' && m.params?.hints));
+  show('push for a game stopped elsewhere', ended.params);
+  assert.match(ended.params.payload.content[0].text, /stopped from another connection/);
+  assert.deepEqual(ended.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  assert.equal(ended.params.toolset, 'game'); assert.ok(ended.params.tags.includes('surface:done'));
+  await waitFor('the end pushed to h2', () => h2.wire.slice(m2).find((m) => m.method === 'push/event' && m.params?.hints));
+
+  // an open on h1b: h2 (closed now) gets a suggestion, not an open
+  const m3 = h2.wire.length;
+  const o2 = (await h1b.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  assert.equal(o2.title, 'freedoom1 E1M1, skill 3');
+  const sug = await waitFor('a suggestion on h2', () => h2.wire.slice(m3).find((m) => m.method === 'tools/hints'));
+  show('tools/hints on the other hinted connection', sug.params);
+  assert.equal(sug.params.suggest[0].action, 'open'); assert.equal(sug.params.toolsets, undefined);
+
+  // close ends the game
+  const closed = (await h1b.call('toolsets/close', { toolset: 'game' })).result;
+  assert.match(textOf(closed), /Stopped your game/);
+  assert.deepEqual(hintsOf(closed)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] });
+
+  // keep: close leaves the game running and closed; the next open picks it up
+  await h1b.call('toolsets/open', { toolset: 'game', options: { keep: true, image: 'none' } });
+  r = await h1b.tool('game_act', { actions: [{ turn: 5 }], image: 'none' });
+  const kept = (await h1b.call('toolsets/close', { toolset: 'game' })).result;
+  assert.match(textOf(kept), /stays on the server/);
+  assert.deepEqual(hintsOf(kept)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  assert.deepEqual((await h1b.call('toolsets/list')).result, { open: [] }, 'a kept game is not open');
+  r = await h1b.tool('game_act', { actions: [{ wait: 1 }] });
+  assert.ok(r.isError && /kept on the server/.test(textOf(r)));
+  assert.match(textOf(await h1b.tool('game_list')), /Kept on the server/);
+  const back = (await h1b.call('toolsets/open', { toolset: 'game', options: { keep: false, image: 'none' } })).result;
+  assert.match(textOf(back), /Picked up the game you kept/); assert.match(textOf(back), /turn 1/);
+  assert.match(textOf((await h1b.call('toolsets/close', { toolset: 'game' })).result), /Stopped your game/);
+
+  // vector 4: on every connection, revs strictly increase in wire order
+  for (const host of [h1, h1b, h2, plain]) {
+    const revs = host.hints().map((x) => x.h.rev);
+    for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
+    console.log(`${host.label}: ${revs.length} hint changes, revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ') || 'none'})`);
+  }
+  // vector 8: nothing hint-shaped ever reached the plain host
+  assert.equal(plain.hints().length, 0);
+  assert.ok(!plain.wire.some((m) => m.method === 'tools/hints' || (m.method === 'push/event' && (m.params?.hints || m.params?.toolset))));
+  for (const host of [h1b, h2, plain]) host.close();
+}
+
+main().catch((e) => { console.error('HINTS FAILED', e); process.exit(1); });
