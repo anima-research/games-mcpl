@@ -232,7 +232,8 @@ async function run() {
   assert.ok(tools.every((t) => t._meta?.['mcpl/presence']));
   assert.deepEqual(tools.filter((t) => t._meta['mcpl/presence'] === 'static').map((t) => t.name).sort(), ['game_list', 'game_results']);
   assert.ok(tools.filter((t) => t._meta['mcpl/toolset'] === 'game').every((t) => t._meta['mcpl/visible'] === false), 'lobby: nothing in the toolset is visible');
-  assert.deepEqual((await h1.call('toolsets/list')).result, { open: [] });
+  // RFC-014 r6 §5.3: a toolsets/list result always carries its hints and takes a rev, empty or not
+  assert.deepEqual((await h1.call('toolsets/list')).result, { open: [], _meta: { 'mcpl/hints': { rev: 1, tools: [] } } });
   let r = await h1.tool('game_act', { actions: [{ wait: 1 }] });
   assert.ok(r.isError && /not open: you have no game/.test(textOf(r)), 'a closed toolset refuses its tools');
   assert.equal((await h1.call('toolsets/open', { toolset: 'chess' })).error?.code, -32602);
@@ -349,6 +350,8 @@ async function run() {
   assert.deepEqual(hintsOf(closed)!.toolsets, [{ toolset: 'game', state: 'closed' }]);
   const afterClose = (await h1b.call('toolsets/list')).result;
   assert.deepEqual(afterClose.open, []);
+  assert.deepEqual(hintsOf(afterClose)!.tools, [], 'an empty statement, under its own rev');
+  assert.equal(hintsOf(afterClose)!.rev, hintsOf(closed)!.rev + 1);
   assert.deepEqual(afterClose.ended.map((e: Msg) => e.id), [`game-${gameId}`], 'the plain host\'s game_stop is recorded; this toolsets/close is not');
   const closedOnH2 = await waitFor('the close on h2', () => h2.wire.slice(m5).find((m) => m.method === 'push/event' && m.params?.hints));
   assert.deepEqual(closedOnH2.params.hints.toolsets, [{ toolset: 'game', state: 'closed' }]);

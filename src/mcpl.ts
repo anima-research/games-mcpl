@@ -361,7 +361,10 @@ export class McplSession {
               if (ended.length) b.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
               this.told = closedTold();
             }
-            const h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full: true, mayOpen: true });
+            let h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full: true, mayOpen: true });
+            // RFC-014 r6 §5.3: a toolsets/list result always carries its hints and takes a rev — with an
+            // empty `tools` when nothing is open — so that an empty statement still clears stale state.
+            if (!h && m.method === 'toolsets/list') h = { rev: ++this.rev, tools: [] };
             this.result(m.id, { ...body, ...(h ? { _meta: { 'mcpl/hints': h } } : {}) });
           } catch (e) {
             if (e instanceof RpcError) this.error(m.id, e.code, e.message);
