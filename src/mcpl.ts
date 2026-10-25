@@ -18,7 +18,7 @@ import { describe, ACTION_HELP } from './describe.js';
 import type { Observation } from './engine.js';
 import { nextMap, type GameSession, type GameStatus, type Principal, type StateChange } from './games.js';
 import {
-  GAME_TOOLS, TOOLSET, closedTold, current, diff, hinted, isGameTool, unavailable,
+  TOOLSET, closedTold, current, diff, hinted, isGameTool, unavailable,
   type GameView, type HintChanges, type Told, type Tool,
 } from './hints.js';
 import {
@@ -122,8 +122,6 @@ export class McplSession {
   private rev = 0;
   /** What this host has been told about the game toolset (its state on the host, as far as we know). */
   private told: Told = closedTold();
-  /** Ended games already reported to this connection in toolsets/list `ended`: once each. */
-  private reportedEnds = new Set<string>();
   private peerTimer: NodeJS.Timeout | null = null;
   private peerEnded: { id: string; text: string } | null = null;
 
@@ -201,8 +199,9 @@ export class McplSession {
 
   /**
    * What changed since this host was last told, as a HintChanges with the next rev, or null.
-   * RFC-014 §6.1: hint changes leave a connection in rev order, so every caller writes the
-   * message in the same synchronous step that allocated the rev (no await in between).
+   * RFC-014 §6.1: the messages carrying hint changes on a connection are numbered consecutively
+   * (1, 2, 3…) in the order they are written — so a rev is allocated only for changes that exist,
+   * and every caller writes the message in the same synchronous step (no await in between).
    */
   private changes(opts: { full?: boolean; mayOpen: boolean }): HintChanges | null {
     const r = diff(this.told, current(this.gameView()), (t) => this.definition(t), opts);
@@ -212,26 +211,18 @@ export class McplSession {
 
   private notifyHints(h: HintChanges) { this.send({ jsonrpc: '2.0', method: 'tools/hints', params: h }); }
 
-  /** A change with an event that explains it rides that event; without pushes, it goes standalone. */
+  /**
+   * A change with an event that explains it rides that event; without pushes, it goes standalone.
+   * RFC-014 §6.1: a host applies a push's hints when it reads the push, whatever it decides about
+   * the event — so a refused or unanswered push needs nothing restated; the next change takes the
+   * next rev. A push carrying hints is never coalesced (§7).
+   */
   private deliverHints(h: HintChanges, explain: { id: string; text: string; tags: string[] } | null) {
     if (!explain || !this.pushReady()) { this.notifyHints(h); return; }
     this.request('push/event', {
       featureSet: FS_NAME, eventId: explain.id, timestamp: new Date().toISOString(), origin: { server: 'games' },
       tags: explain.tags, toolset: TOOLSET, hints: h, payload: { content: [{ type: 'text', text: explain.text }] },
-    }).then((r) => {
-      // Refused or unanswered: the host did not apply its hints (RFC-014 §6.1). Restate the current
-      // state under a new rev, standalone — never the old rev, which later changes may have passed.
-      if (r !== null && (r as { accepted?: unknown }).accepted !== false) return;
-      this.resync();
     }).catch(() => undefined);
-  }
-
-  /** The host missed a change: restate the toolset's whole state, under a new rev. */
-  private resync() {
-    const cur = current(this.gameView());
-    this.told = cur.open ? closedTold() : { open: true, visible: new Set(GAME_TOOLS), defs: new Map() };
-    const h = this.changes({ full: true, mayOpen: true });
-    if (h) this.notifyHints(h);
   }
 
   /**
@@ -244,8 +235,8 @@ export class McplSession {
     // A connection with the toolset open hears of an end as it happens (in its call's result, or
     // below), so toolsets/list later need not report it as `ended`.
     if (change.ended && this.told.open) {
-      const e = this.app.games.lastEnded.get(this.actor.sub);
-      if (e?.id === change.ended.session.id) e.told = true;
+      const e = this.app.games.ended.get(this.actor.sub)?.find((x) => x.id === `game-${change.ended!.session.id}`);
+      if (e) e.told = true;
     }
     if (change.cause === this) return;
     if (change.ended && this.told.open) {
@@ -363,17 +354,15 @@ export class McplSession {
           try {
             const body = m.method === 'toolsets/open' ? await this.openGame(params) : m.method === 'toolsets/close' ? await this.closeGame(params) : {};
             if (m.method === 'toolsets/list') {
-              // RFC-014 §5.3: what this identity holds open, with full hint state; the host starts over.
-              // And a game that ended unseen (the idle sweep or the web stop while no hinted connection
-              // had it open): `ended`, once per connection, while there is no newer game.
+              // RFC-014 §5.3: what this identity holds open, and its hint state in full as of this
+              // result's rev (a tool not stated visible is invisible); the host replaces its state with it.
+              // And games that ended while no connection could be told (the idle sweep, the web stop):
+              // `ended` records, each with an id, on every list until they expire; hosts dedupe by id.
               const g = this.gameView();
               const b = body as Record<string, unknown>;
               b.open = g && !g.parked ? [{ toolset: TOOLSET, title: g.title }] : [];
-              const e = this.app.games.lastEnded.get(this.actor.sub);
-              if (!g && e && !e.told && !this.reportedEnds.has(e.id) && Date.now() - e.at < ENDED_WINDOW_MS) {
-                this.reportedEnds.add(e.id);
-                b.ended = [{ toolset: TOOLSET, reason: `${e.why} (${e.summary})` }];
-              }
+              const ended = this.app.games.endedRecords(this.actor.sub, ENDED_WINDOW_MS).filter((e) => !e.told);
+              if (ended.length) b.ended = ended.map((e) => ({ id: e.id, toolset: TOOLSET, reason: `${e.why} (${e.summary})` }));
               this.told = closedTold();
             }
             const h = this.changes(m.method === 'toolsets/close' ? { mayOpen: false } : { full: true, mayOpen: true });

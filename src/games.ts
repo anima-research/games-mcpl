@@ -148,11 +148,19 @@ export class Games extends EventEmitter {
   readonly recent: PublicGame[] = [];
   private byOwner = new Map<string, GameSession>();
   /**
-   * Each player's last ended game, for MCPL toolsets/list `ended` (RFC-014 §5.3). `told`: a hinted
-   * connection that had the toolset open heard of the end as it happened, so it is not news later.
+   * Each player's ended games, for MCPL toolsets/list `ended` (RFC-014 §5.3). `told`: a hinted
+   * connection that had the toolset open heard of the end as it happened, so it is not reported.
    * In memory only: after a restart there is nothing to report.
    */
-  readonly lastEnded = new Map<string, { id: string; why: string; summary: string; at: number; told: boolean }>();
+  readonly ended = new Map<string, Array<{ id: string; why: string; summary: string; at: number; told: boolean }>>();
+
+  /** A player's `ended` records from the last `withinMs` (older ones are dropped). */
+  endedRecords(sub: string, withinMs: number) {
+    const keep = (this.ended.get(sub) ?? []).filter((e) => e.at > Date.now() - withinMs);
+    if (keep.length) this.ended.set(sub, keep); else this.ended.delete(sub);
+    return keep;
+  }
+
   readonly catalogue: Catalogue;
   readonly recordings: Recordings;
   private sweeper: NodeJS.Timeout;
@@ -353,7 +361,10 @@ export class Games extends EventEmitter {
     this.recent.splice(30);
     try { appendFileSync(join(this.config.dataDir, 'results.jsonl'), JSON.stringify({ ...pub, why }) + '\n'); } catch (e) { this.log(`results write failed: ${(e as Error).message}`); }
     this.log(`${session.owner.name}'s game ${session.id} ended: ${session.status} (${why})`);
-    this.lastEnded.set(session.owner.sub, { id: session.id, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt, told: false });
+    // id: the game's own (random, never reused for this player), so a host can dedupe across reconnects.
+    const records = this.ended.get(session.owner.sub) ?? [];
+    records.push({ id: `game-${session.id}`, why, summary: `${session.game} ${session.map}, turn ${session.turn}`, at: session.endedAt, told: false });
+    this.ended.set(session.owner.sub, records.slice(-20));
     this.emit('ended', session);
     this.emit('list');
     this.emit('state', session.owner.sub, { cause, ended: { session, why } } satisfies StateChange);

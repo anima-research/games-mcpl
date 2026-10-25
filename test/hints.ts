@@ -5,8 +5,9 @@
 // server (like test/resume.ts) and checks the conformance vectors of RFC-014 §13 that apply to a
 // server: 1 (full list), 2 (call results carry hints, no push for them), 4 (rev order),
 // 7 (a definition change without tools/list_changed), 8 (no hints to a host without toolHints),
-// 9 (toolsets/list after a reconnect adopts the running game), 11 (a refused push is restated
-// under a new rev), 12 (toolsets/list restates a current definition), 13 (`ended`), 14 (another
+// 9 (toolsets/list after a reconnect adopts the running game), 11 (a refused push is not
+// restated: its hints applied on arrival, and the next change takes the next rev), 12
+// (toolsets/list is a full statement, with current definitions), 13 (`ended` records by id), 14 (another
 // connection hears of an open as a state change), 16 (close results carry hints), 18 (`adopted`),
 // 19 (no `coalesce` on a push carrying hints). A second server, on a scripted
 // sidecar (test/fake_sidecar.py) that finishes a level on cue, covers level complete: game_next
@@ -121,6 +122,10 @@ async function scripted() {
   // vector 12: toolsets/list (the recovery read) restates the current definition
   const rl = (await h.call('toolsets/list')).result;
   assert.equal(hintsOf(rl)!.tools.find((t: Msg) => t.name === 'game_next').definition.description, 'Go on to the next map, E2M1 (same game and skill).');
+  // a full statement: every tool visible in the open toolset is stated visible (anything not stated visible is invisible)
+  assert.deepEqual(hintsOf(rl)!.tools.filter((t: Msg) => t.visible).map((t: Msg) => t.name).sort(),
+    ['game_look', 'game_next', 'game_restart', 'game_say', 'game_start', 'game_state', 'game_stop', 'game_watchers']);
+  assert.deepEqual(hintsOf(rl)!.toolsets, [{ toolset: 'game', state: 'open', title: 'freedoom1 E1M8, skill 3' }]);
   const listed = ((await h.call('tools/list')).result.tools as Msg[]).find((t) => t.name === 'game_next')!;
   assert.equal(listed._meta['mcpl/visible'], true);
   assert.match(listed.description, /after finishing a level/, 'tools/list keeps the declared definition');
@@ -155,13 +160,16 @@ async function scripted() {
   const mark2 = h.wire.length;
   assert.equal((await post(`/api/games/${id2}/stop`, {}, { Authorization: `Bearer ${tok.token}` })).status, 200);
   const refused = await waitFor('the refused push', () => h.wire.slice(mark2).find((m) => m.method === 'push/event' && m.params?.hints));
-  const restated = await waitFor('the restatement', () => h.wire.slice(mark2).find((m) => m.method === 'tools/hints'));
-  show('refused push, then restated standalone', { push: refused.params.hints, restated: restated.params });
-  assert.ok(restated.params.rev > refused.params.hints.rev, 'a new rev, never the old one');
-  assert.deepEqual(restated.params.toolsets, [{ toolset: 'game', state: 'closed' }]);
+  await sleep(300);
+  assert.ok(!h.wire.slice(mark2).some((m) => m.method === 'tools/hints'), 'RFC-014 r4: nothing is restated after a refused push');
   h.refuse = false;
-  // §5.3 `ended`: a game that ends while no hinted connection has it open is reported by toolsets/list,
-  // once per connection; one this connection heard of as it happened is not
+  const nextChange = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
+  show('a refused push, then the next change', { refused: refused.params.hints.rev, next: hintsOf(nextChange)!.rev });
+  assert.equal(hintsOf(nextChange)!.rev, refused.params.hints.rev + 1, 'the next change takes the next rev');
+  await h.call('toolsets/close', { toolset: 'game' });
+  // §5.3 `ended`: a game that ends while no connection could be told is reported by toolsets/list, as a
+  // record with an id, on every list until it expires (hosts dedupe by id); one a connection heard of
+  // as it happened is not
   const told = new Host('told', tok.token, true); await told.connect(); await told.init();
   assert.deepEqual((await told.call('toolsets/list')).result, { open: [] });
   const o3 = (await h.call('toolsets/open', { toolset: 'game', options: { image: 'none' } })).result;
@@ -172,18 +180,21 @@ async function scripted() {
   const l1 = (await later.call('toolsets/list')).result;
   show('toolsets/list after a game ended unseen', l1);
   assert.deepEqual(l1.open, []);
-  assert.deepEqual(l1.ended, [{ toolset: 'game', reason: 'stopped by Hints Tester (freedoom1 E1M1, turn 0)' }]);
-  assert.equal((await later.call('toolsets/list')).result.ended, undefined, 'once per connection');
+  assert.deepEqual(l1.ended, [{ id: `game-${id3}`, toolset: 'game', reason: 'stopped by Hints Tester (freedoom1 E1M1, turn 0)' }]);
+  assert.deepEqual((await later.call('toolsets/list')).result.ended, l1.ended, 'every list, the same id');
   const other = new Host('other', tok.token, true); await other.connect(); await other.init();
-  assert.equal((await other.call('toolsets/list')).result.ended?.length, 1, 'and once on each connection');
+  assert.deepEqual((await other.call('toolsets/list')).result.ended, l1.ended, 'a reconnect: the same record, the same id');
   await later.call('toolsets/open', { toolset: 'game', options: { image: 'none' } });
   const fresh = new Host('fresh', tok.token, true); await fresh.connect(); await fresh.init();
-  assert.equal((await fresh.call('toolsets/list')).result.ended, undefined, 'not while a newer game is there');
+  const lf = (await fresh.call('toolsets/list')).result;
+  assert.deepEqual(lf.ended, l1.ended, 'a second reconnect, with a newer game open: still the same id until it expires');
+  assert.equal(lf.open.length, 1);
   await later.call('toolsets/close', { toolset: 'game' });
   for (const host of [h, told, later, other, fresh]) {
     assert.ok(!host.wire.some((m) => m.method === 'push/event' && m.params?.hints && m.params?.coalesce), 'vector 19');
+    // RFC-014 r4: consecutive revs on each connection, across results, pushes and tools/hints
     const revs = host.hints().map((x) => x.h.rev);
-    for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
+    revs.forEach((rev, i) => assert.equal(rev, i + 1, `${host.label}: revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ')})`));
   }
   for (const host of [later, other, fresh]) host.close();
 }
@@ -351,8 +362,9 @@ async function run() {
   // vector 4: on every connection, revs strictly increase in wire order
   for (const host of [h1, h1b, h2, plain]) {
     assert.ok(!host.wire.some((m) => m.method === 'push/event' && m.params?.hints && m.params?.coalesce), 'vector 19');
+    // RFC-014 r4: consecutive revs on each connection, across results, pushes and tools/hints
     const revs = host.hints().map((x) => x.h.rev);
-    for (let i = 1; i < revs.length; i++) assert.ok(revs[i] > revs[i - 1], `${host.label}: rev ${revs[i]} after ${revs[i - 1]}`);
+    revs.forEach((rev, i) => assert.equal(rev, i + 1, `${host.label}: revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ')})`));
     console.log(`${host.label}: ${revs.length} hint changes, revs ${revs.join(' ')} (${host.hints().map((x) => x.via).join(', ') || 'none'})`);
   }
   // vector 8: nothing hint-shaped ever reached the plain host
