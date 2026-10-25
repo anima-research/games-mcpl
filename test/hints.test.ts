@@ -3,7 +3,7 @@
 //   npm test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { GAME_TOOLS, closedTold, current, diff, hinted, unavailable, visibleFor, type GameView, type Tool } from '../src/hints.js';
+import { GAME_TOOLS, closedTold, current, diff, diffUnits, hinted, unavailable, unitKey, visibleFor, type GameView, type Tool, type Units } from '../src/hints.js';
 
 const view = (status: GameView['status'], extra: Partial<GameView> = {}): GameView =>
   ({ id: 'g1', status, parked: false, next: null, title: 'freedoom1 E1M1, skill 3', map: 'E1M1', ...extra });
@@ -81,4 +81,22 @@ test('an open is reported only by an exchange that may report it (not a static t
 test('hinted(): static vs toolset tools', () => {
   assert.deepEqual(hinted(define('game_list'), true)._meta, { 'mcpl/presence': 'static' });
   assert.deepEqual(hinted(define('game_act'), false)._meta, { 'mcpl/presence': 'dynamic', 'mcpl/toolset': 'game', 'mcpl/visible': false });
+});
+
+test('units: entries of a toolset with instances carry the instance; closing one leaves the others alone', () => {
+  const tools = ['go_play', 'go_resign'];
+  const unit = (visible: string[], title = 'Go 9×9') => ({ open: true, title, visible: new Set(visible), defs: new Map<string, string>() });
+  const a = unitKey('go', 'a'); const b = unitKey('go', 'b');
+  const cur: Units = new Map([[a, unit(['go_play', 'go_resign'])], [b, unit(['go_resign'])]]);
+  const opened = diffUnits(new Map(), cur, () => tools, () => define('x'), { full: new Set([a]), mayOpen: true });
+  assert.ok(opened.changes!.tools!.every((t) => t.instance === 'a' || t.instance === 'b'));
+  assert.deepEqual(opened.changes!.toolsets!.map((t) => t.instance).sort(), ['a', 'b']);
+  // b's move: only b changes
+  const moved = diffUnits(opened.told, new Map([[a, unit(['go_play', 'go_resign'])], [b, unit(['go_play', 'go_resign'])]]), () => tools, () => define('x'), { mayOpen: true });
+  assert.deepEqual(moved.changes, { tools: [{ name: 'go_play', instance: 'b', visible: true }] });
+  // a closes
+  const closed = diffUnits(moved.told, new Map([[b, unit(['go_play', 'go_resign'])]]), () => tools, () => define('x'), { mayOpen: false });
+  assert.deepEqual(closed.changes!.toolsets, [{ toolset: 'go', instance: 'a', state: 'closed' }]);
+  assert.ok(closed.changes!.tools!.every((t) => t.instance === 'a' && t.visible === false));
+  assert.deepEqual([...closed.told.keys()], [b]);
 });

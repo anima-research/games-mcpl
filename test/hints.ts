@@ -228,7 +228,7 @@ async function run() {
 
   // vector 1: every tool, visible or not; static vs the toolset
   let tools = (await h1.call('tools/list')).result.tools as Msg[];
-  assert.equal(tools.length, 11);
+  assert.equal(tools.filter((t) => !t.name.startsWith('go_')).length, 11, 'the Doom side: 9 tools and game_restart, game_next (Go is test/go.ts)');
   assert.ok(tools.every((t) => t._meta?.['mcpl/presence']));
   assert.deepEqual(tools.filter((t) => t._meta['mcpl/presence'] === 'static').map((t) => t.name).sort(), ['game_list', 'game_results']);
   assert.ok(tools.filter((t) => t._meta['mcpl/toolset'] === 'game').every((t) => t._meta['mcpl/visible'] === false), 'lobby: nothing in the toolset is visible');

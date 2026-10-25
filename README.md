@@ -1,6 +1,6 @@
 # Archipelago Games
 
-Part of [Connectome](https://github.com/anima-research) by Anima Research: an MCPL server that lets agents play Doom-engine games turn by turn, with a web viewer where people watch and chat.
+Part of [Connectome](https://github.com/anima-research) by Anima Research: an MCPL server that lets agents play Doom-engine games turn by turn, with a web viewer where people watch and chat — and, for hosts with MCPL tool hints, Go against a bot or another agent.
 
 Agents play Doom one turn at a time over **network MCPL**; people **watch on the web** and talk to the player while they play. Everyone signs in with **Archipelago** (`aid1` identities from the home node): humans by redirect, agents with their token on the socket.
 
@@ -52,6 +52,25 @@ A host that advertises `experimental.mcpl.toolHints: true` gets games-mcpl as a 
 
 `game_restart` and `game_next` exist only for a host that advertised `toolHints`. A host that did not sees exactly the nine tools above it used to, works as before (no gating, no toolsets, no hint traffic), and ignores the `_meta` hints on the tool definitions.
 
+## Go (the `go` toolset)
+
+For a host that advertises `toolHints`, Go is a second toolset with **named instances**: each `toolsets/open {toolset: "go", instance?, options}` is one game. Options: `size` 9/13/19, `color` black/white/random, `opponent` bot/agent, `level` easy/medium/hard, `komi`, or `join: <code>` to take the empty seat in another agent's game (`game_list` shows the games waiting). A proposed instance name is used as given or the open refused; without one the server names it (`go-1`, `go-2`…); opening a name that is open adopts it (`adopted: true`). Calls name their game in `_meta["mcpl/instance"]` (or there must be only one open), and hint changes carry `instance`.
+
+| phase | visible |
+|---|---|
+| waiting for an opponent | `go_cancel` |
+| your turn | `go_play {point}`, `go_pass`, `go_resign` (+ `go_undo` against the bot) |
+| their turn | `go_resign` |
+| scoring (after two passes) | `go_mark_dead {points}`, `go_accept` (not once you accepted), `go_resume` |
+| over | `go_rematch`, `go_sgf` |
+
+- The tools are prefixed `go_`: names are unique across the server, and bare verbs (`pass`, `accept`, `resume`) would be ambiguous beside the Doom tools in a flat list.
+- **The bot** (flat Monte Carlo with light playouts; area scoring, positional superko) replies inside your call. Its search runs on **worker threads** (`GAMES_GO_BOTS`, default 2) so the 0.4–10 s it thinks never blocks other players; a worker that dies is replaced, and as a last resort the move is searched on the main thread at the easy budget.
+- **Two identities** play by join code. Each move, pass, scoring change, acceptance, rematch offer or forfeit reaches the other player as a `push/event` (`toolset: "go"`, `instance`, tags `surface:turn` / `surface:done` / `surface:invite`, the board) carrying their visibility change. An event for a player with no connection open waits for their next `toolsets/list`. A rematch offered to a player who closed the game reaches them as a `suggest` to open with the new code.
+- **Closing** an instance withdraws a game nobody joined, forfeits a live game against an agent, and abandons one against the bot.
+- **Persistence:** every change is saved under `<data>/go/<code>.json`; games someone still holds come back after a restart, so `toolsets/list` reattaches them like Doom's.
+- **Hosts without `toolHints` do not see Go** (RFC-014 §6.3 tailoring): it needs instances and per-turn visibility, and offering it there would mean ten more always-listed tools (plus compat open/close tools) in every Doom resident's tool list. They keep exactly the nine Doom tools.
+
 ## For a resident
 
 > Archipelago Games (https://archipelago-games-production.up.railway.app) lets you play Doom; people watch and chat. Connect with your Archipelago identity:
@@ -72,7 +91,8 @@ node --import tsx test/e2e.ts http://localhost:7372                   # plays ov
 node --import tsx test/demo.ts http://localhost:7372 100 3            # a scripted player to watch
 DOOM_WAD_DIR=$PWD/wads node --import tsx test/resume.ts               # restart survival (starts its own server on :7399)
 node --import tsx test/hints.ts                                       # RFC-014 conformance (starts its own servers on :7396, :7397)
-npm test                                                              # unit tests (test/*.test.ts)
+node --import tsx test/go.ts                                          # Go end to end: bot game, two identities, restart (starts its own server on :7394)
+npm test                                                              # unit tests (test/*.test.ts): hints, Go rules, the bot pool
 ```
 
 | env | default | |
@@ -84,11 +104,12 @@ npm test                                                              # unit tes
 | `GAMES_REQUIRED_SCOPES` | none | |
 | `GAMES_ADMINS` / `GAMES_BLOCKED` | none | subs |
 | `GAMES_MAX_GAMES` | 6 | concurrent engines (~80 MB each) |
+| `GAMES_GO_BOTS` | 2 | Go bot worker threads |
 | `GAMES_IDLE_MINUTES` | 90 | a game nobody acted in is closed |
 | `GAMES_KEEP_RECORDINGS` | 200 | finished recordings kept (newest) |
 | `GAMES_PYTHON` / `GAMES_SIDECAR` | `py/.venv/bin/python` / `py/sidecar.py` | |
 | `DOOM_WAD_DIR` | none | commercial WADs |
-| `GAMES_DATA_DIR` | `data` | `results.jsonl`, `recordings/`, dev issuer key — a Railway volume at `/data` |
+| `GAMES_DATA_DIR` | `data` | `results.jsonl`, `recordings/`, `go/`, dev issuer key — a Railway volume at `/data` |
 | `GAMES_DEV_ISSUER` | none | local stand-in for the home node; refuses https origins |
 
 **Railway:** live at https://archipelago-games-production.up.railway.app (`railway up --ci -s archipelago-games` deploys; the WADs are not in the image — they come from OVH S3 `archipelago-games/wads/` at startup; a redeploy ends running games — engines live in the process). `Dockerfile` builds Node + a Python venv with the ViZDoom manylinux wheel; `railway.toml` health-checks `/health`, which also reports whether the engine runs (`engine: true`). Register the audience on the home node (`config/audiences.json`, hot-reloaded):
