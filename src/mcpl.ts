@@ -38,9 +38,32 @@ const FS_NAME = 'games';
 const PUSH_TIMEOUT_MS = 30_000;
 
 const featureSetDecl: FeatureSetDeclaration05 = {
-  description: 'Play Doom (and more games later) turn by turn; people watch on the web and talk to you. Push events: chat from watchers while you are idle.',
+  description: 'Play Doom turn by turn while people watch on the web and talk to you, and Go against the bot, other agents or people. Push events: your Go opponent\'s moves and offers, the end of a game you did not end, and chat from watchers while you are idle.',
   uses: ['tools', 'pushEvents'],
   rollback: false,
+  // RFC-001 §5: what the events carry, and how this server suggests treating them. Suggestions
+  // only; the host applies them if its agent or operator accepts (§5.2).
+  tagOntology: {
+    coreTags: ['chat:addressed', 'chat:from-human'],
+    tags: {
+      'surface:turn': { desc: 'A Go game is waiting on you: your move, a join (you move first), or a scoring decision.', facet: 'addressing' },
+      'surface:invite': { desc: 'Your Go opponent offers a rematch (or, after you closed the game, suggests opening it).', facet: 'addressing' },
+      'surface:done': { desc: 'A game of yours ended without you ending it: a Go game over by resignation, forfeit or agreed score, or a Doom game stopped from the web page, by the idle sweep, or by its engine dying.', facet: 'lifecycle' },
+      'games:chat': { desc: 'Someone watching your Doom game said something while you were between turns (also tagged chat:addressed and chat:from-human).', facet: 'content' },
+      'games:ended': { desc: 'Your Doom game ended without you ending it (with surface:done).', facet: 'lifecycle' },
+      'go:start': { desc: 'An opponent joined your Go game, or accepted your rematch.', facet: 'lifecycle' },
+      'go:move': { desc: 'Your Go opponent played or passed.', facet: 'content' },
+      'go:scoring': { desc: 'Both passed, or the dead stones or acceptances changed.', facet: 'content' },
+      'go:over': { desc: 'A Go game ended.', facet: 'lifecycle' },
+      'go:rematch': { desc: 'A Go rematch was offered.', facet: 'lifecycle' },
+    },
+    suggestedTreatment: [
+      { tagsAny: ['surface:turn', 'surface:invite'], behavior: 'immediate', rationale: 'An opponent is waiting on you; declining leaves your Go games stalled until you look.' },
+      { tagsAny: ['surface:done'], behavior: 'immediate', rationale: 'A game you were in ended without you; the result, a rematch offer or a stop from the web page is in the event.' },
+      { tagsAny: ['games:chat'], behavior: { debounce: 60_000 }, rationale: 'People watching talk to you between turns; batched, a burst of messages arrives as one, a minute after the last.' },
+    ],
+    open: true,
+  },
 };
 const declaredFeatureSets: FeatureSetMap = { [FS_NAME]: featureSetDecl };
 const featureSets: FeatureSetWireEntry[] = [{ name: FS_NAME, ...featureSetDecl }];
