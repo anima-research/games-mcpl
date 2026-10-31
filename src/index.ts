@@ -36,7 +36,7 @@ export class App {
     if (this.config.wadDir) this.wads = await syncWads(this.config.wadDir, wadSyncFromEnv(), log);
     this.games = new Games(this.config, (m) => log(`[games] ${m}`));
     this.bots = new BotPool(this.config.goBots, (m) => log(`[go] ${m}`));
-    this.go = new GoTables(join(this.config.dataDir, 'go'), this.bots, (m) => log(`[go] ${m}`));
+    this.go = new GoTables(join(this.config.dataDir, 'go'), this.bots, (m) => log(`[go] ${m}`), this.config.origin);
     if (this.config.devIssuer) {
       this.devIssuer = new DevIssuer(this.config.devIssuer, this.config.dataDir);
       this.issuers.set(this.config.devIssuer, (await resolveIssuers([{ domain: this.config.devIssuer, publicKey: this.devIssuer.publicKey }])).get(this.config.devIssuer)!);

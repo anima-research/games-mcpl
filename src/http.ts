@@ -1,5 +1,5 @@
-// HTTP: sign-in (Archipelago redirect → session cookie), the viewer API, the
-// viewer WebSocket stream (/ws), static files, health.
+// HTTP: sign-in (Archipelago redirect → session cookie), the viewer API (Doom watching, Go playing), the
+// viewer WebSocket stream (/ws: lobby, ?game= a Doom game, ?go= a Go board), static files, health.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
@@ -73,11 +73,30 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
 
   // ---------------------------------------------------------------- viewer stream
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
-  const lobby = new Set<WebSocket>();
+  const lobby = new Map<WebSocket, Principal>();
   const watchers = new Map<WebSocket, { session: GameSession; who: Principal }>();
   const send = (ws: WebSocket, msg: unknown) => { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg)); };
   const turnMessage = (s: GameSession, rec: TurnRecord) => ({ type: 'turn', game: s.public(), record: rec, frame: s.frame ? s.frame.toString('base64') : null, automap: s.automap ? s.automap.toString('base64') : null, last: s.last });
-  app.games.on('list', () => { const games = app.games.list(); const recent = app.games.recent.slice(0, 12); for (const ws of lobby) send(ws, { type: 'list', games, recent }); });
+  app.games.on('list', () => { const games = app.games.list(); const recent = app.games.recent.slice(0, 12); for (const ws of lobby.keys()) send(ws, { type: 'list', games, recent }); });
+
+  // Go boards: each page watching a match gets its state (as that viewer sees it) after every change;
+  // the lobby gets the Go list. A burst of saves inside one operation goes out once.
+  const goWatchers = new Map<WebSocket, { code: string; who: Principal }>();
+  const goDirty = new Set<string>();
+  let goTimer: NodeJS.Timeout | null = null;
+  app.go.on('match', (code: string) => {
+    goDirty.add(code);
+    goTimer ??= setTimeout(() => {
+      goTimer = null;
+      const codes = new Set(goDirty); goDirty.clear();
+      for (const [ws, w] of goWatchers) {
+        if (!codes.has(w.code)) continue;
+        const l = app.go.lookup(w.code);
+        send(ws, l ? { type: 'go', state: app.go.webState(l.match, w.who.sub, l.live) } : { type: 'go-gone' });
+      }
+      for (const [ws, who] of lobby) send(ws, { type: 'golist', ...app.go.webList(who.sub) });
+    }, 30);
+  });
   app.games.on('turn', (s: GameSession, rec: TurnRecord) => { const msg = turnMessage(s, rec); for (const [ws, w] of watchers) if (w.session === s) send(ws, msg); });
   app.games.on('chat', (s: GameSession, m: ChatMessage) => { for (const [ws, w] of watchers) if (w.session === s) send(ws, { type: 'chat', message: m }); });
   app.games.on('ended', (s: GameSession) => { for (const [ws, w] of watchers) if (w.session === s) send(ws, { type: 'ended', game: s.public() }); });
@@ -155,6 +174,46 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
         if (!actor) throw new Fault(401, 'Sign in to watch.');
         if (path === '/api/games' && method === 'GET') { sendJson(200, { games: app.games.list(), recent: app.games.recent.slice(0, 12), catalogue: app.games.catalogue }); return; }
         if (path === '/api/recordings' && method === 'GET') { sendJson(200, { recordings: app.games.recordings.list().slice(0, 60) }); return; }
+
+        // ---------------------------------------------- Go
+        if (path === '/api/go' && method === 'GET') { sendJson(200, app.go.webList(actor.sub)); return; }
+        if (path === '/api/go' && method === 'POST') {
+          sameOrigin(req);
+          const body = await json(req);
+          const o: Record<string, unknown> = {};
+          for (const k of ['size', 'color', 'opponent', 'level', 'komi']) if (body[k] !== undefined) o[k] = body[k];
+          const m = await app.go.webCreate(actor, o);
+          sendJson(200, { state: app.go.webState(m, actor.sub) });
+          return;
+        }
+        const gm = /^\/api\/go\/([0-9A-Fa-f]{6})(?:\/([a-z]+))?$/.exec(path);
+        if (gm) {
+          const code = gm[1]!.toUpperCase();
+          const act = gm[2];
+          if (method === 'GET' && (!act || act === 'sgf')) {
+            const l = app.go.lookup(code);
+            if (!l) throw new Fault(404, 'No Go game with that code.');
+            if (!act) { sendJson(200, { state: app.go.webState(l.match, actor.sub, l.live) }); return; }
+            res.writeHead(200, { 'Content-Type': 'application/x-go-sgf; charset=utf-8', 'Content-Disposition': `attachment; filename="go-${code}.sgf"`, 'Cache-Control': 'no-store' });
+            res.end(l.match.sgf());
+            return;
+          }
+          if (method === 'POST' && act) {
+            sameOrigin(req);
+            if (act === 'join') { const m = await app.go.webJoin(actor, code); sendJson(200, { state: app.go.webState(m, actor.sub) }); return; }
+            const tool = GO_WEB_ACTIONS[act];
+            if (!tool) throw new Fault(404, 'Not found.');
+            const body = await json(req);
+            const args: Record<string, unknown> = {};
+            if (body.point !== undefined) args.point = String(body.point);
+            if (Array.isArray(body.points)) args.points = body.points.slice(0, 40).map(String);
+            const out = await app.go.webCall(actor, code, tool, args);
+            if (out.isError) throw new Fault(409, out.text);
+            const l = app.go.lookup(code);
+            sendJson(200, { text: out.text, state: l ? app.go.webState(l.match, actor.sub, l.live) : null });
+            return;
+          }
+        }
         const rm = /^\/api\/recordings\/([a-z0-9]+)(?:\/(f|m)\/(\d+)\.jpg)?$/.exec(path);
         if (rm && method === 'GET') {
           const meta = app.games.recordings.meta(rm[1]);
@@ -202,7 +261,7 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
 
       // ------------------------------------------------ static / SPA
       if (method !== 'GET' && method !== 'HEAD') throw new Fault(405, 'Method not allowed.');
-      let file = path === '/' || path === '/auth/callback' || /^\/(g|r)\/[a-z0-9]+$/.test(path) ? 'index.html' : normalize(path).replace(/^\/+/, '');
+      let file = path === '/' || path === '/auth/callback' || /^\/(g|r)\/[a-z0-9]+$/.test(path) || /^\/go\/[0-9A-Fa-f]{6}$/.test(path) ? 'index.html' : normalize(path).replace(/^\/+/, '');
       if (file.includes('..')) throw new Fault(404, 'Not found.');
       const full = join(publicDir, file);
       if (!existsSync(full) || !statSync(full).isFile()) throw new Fault(404, 'Not found.');
@@ -230,8 +289,15 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
     } catch { who = null; }
     if (!who) { try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); } catch { /* ignore */ } socket.destroy(); return; }
     const gameId = url.searchParams.get('game');
+    const goCode = url.searchParams.get('go');
     wss.handleUpgrade(req, socket, head, (ws) => {
-      if (gameId) {
+      if (goCode) {
+        const l = app.go.lookup(goCode);
+        if (!l) { send(ws, { type: 'go-gone' }); ws.close(4004, 'No such game'); return; }
+        goWatchers.set(ws, { code: l.match.code, who: who! });
+        send(ws, { type: 'go', state: app.go.webState(l.match, who!.sub, l.live) });
+        ws.on('close', () => goWatchers.delete(ws));
+      } else if (gameId) {
         const s = app.games.get(gameId);
         if (!s) { send(ws, { type: 'ended', game: null }); ws.close(4004, 'No such game'); return; }
         watchers.set(ws, { session: s, who: who! });
@@ -240,8 +306,9 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
         send(ws, { type: 'hello', you: publicActor(who!), game: s.public(), last: s.last, log: s.log.slice(-120), chat: s.chat.slice(-60), frame: s.frame ? s.frame.toString('base64') : null, automap: s.automap ? s.automap.toString('base64') : null });
         ws.on('close', () => { watchers.delete(ws); s.watchers.delete(ws); app.games.emit('list'); });
       } else {
-        lobby.add(ws);
+        lobby.set(ws, who!);
         send(ws, { type: 'list', games: app.games.list(), recent: app.games.recent.slice(0, 12) });
+        send(ws, { type: 'golist', ...app.go.webList(who!.sub) });
         ws.on('close', () => lobby.delete(ws));
       }
       ws.on('error', () => { /* close follows */ });
@@ -253,3 +320,9 @@ export function createHttp(app: App, log: (m: string) => void): { server: Server
 }
 
 export const publicActor = (a: Principal) => ({ sub: a.sub, name: a.name, kind: a.kind, admin: a.admin });
+
+/** The Go page's actions: POST /api/go/<code>/<action> runs the toolset's tool for the viewer's seat. */
+const GO_WEB_ACTIONS: Record<string, string> = {
+  play: 'go_play', pass: 'go_pass', resign: 'go_resign', undo: 'go_undo', cancel: 'go_cancel',
+  mark: 'go_mark_dead', accept: 'go_accept', resume: 'go_resume', rematch: 'go_rematch',
+};

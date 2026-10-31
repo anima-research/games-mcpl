@@ -1,6 +1,6 @@
 # Archipelago Games
 
-Part of [Connectome](https://github.com/anima-research) by Anima Research: an MCPL server that lets agents play Doom-engine games turn by turn, with a web viewer where people watch and chat — and, for hosts with MCPL tool hints, Go against a bot or another agent.
+Part of [Connectome](https://github.com/anima-research) by Anima Research: an MCPL server that lets agents play Doom-engine games turn by turn, with a web viewer where people watch and chat — and Go, against a bot, another agent, or a person playing on the web page.
 
 Agents play Doom one turn at a time over **network MCPL**; people **watch on the web** and talk to the player while they play. Everyone signs in with **Archipelago** (`aid1` identities from the home node): humans by redirect, agents with their token on the socket.
 
@@ -70,6 +70,14 @@ For a host that advertises `toolHints`, Go is a second toolset with **named inst
 - **Closing** an instance withdraws a game nobody joined, forfeits a live game against an agent, and abandons one against the bot. `go_cancel` is the one way an instance ends without a close; it is recorded in `toolsets/list` `ended` like Doom's ends. A finished game does not end its instance (`go_rematch`, `go_sgf` stay).
 - **Persistence:** every change is saved under `<data>/go/<code>.json`; games someone still holds come back after a restart, so `toolsets/list` reattaches them like Doom's.
 - **Hosts without `toolHints` do not see Go** (RFC-014 §6.3 tailoring): it needs instances and per-turn visibility, and offering it there would mean ten more always-listed tools (plus compat open/close tools) in every Doom resident's tool list. They keep exactly the nine Doom tools.
+
+### Go on the web page
+
+People play Go in the viewer: the lobby lists games waiting for an opponent (with a **Join** button), games in play and games just finished, and **New game** starts one against the bot or with an open seat. Each game has a page, `/go/<code>`, with the board: click a point to play (on a touch screen, tap once to place the stone and again to play it), click a group during scoring to mark it dead or alive, and buttons for whatever the seat can do now (pass, resign, undo against the bot, accept, resume, rematch, withdraw). Anyone signed in can watch; the page follows the game live.
+
+- **A web seat** sits beside the bot and agents' instances in the same match (`src/go/toolset.ts`, "the web page"). Its actions are the toolset's own tools, run by the same code under the match's lock, so an agent across the board hears of a person's moves exactly as it hears of another agent's (`push/event`, `surface:turn`, the board; the person is labelled "on the web"). An agent's waiting game says where a person joins (`<origin>/go/<code>`), and `game_list` shows games people are waiting in.
+- **API** (signed in; POSTs same-origin): `GET /api/go` (the lists), `POST /api/go {size, color, opponent: bot|agent, level, komi}` (`agent` = an open seat), `GET /api/go/<code>` (the state as you see it: your colour and the actions open to you), `GET /api/go/<code>/sgf`, `POST /api/go/<code>/join`, and `POST /api/go/<code>/<action>` for `play {point}`, `pass`, `resign`, `undo`, `cancel`, `mark {points}`, `accept`, `resume`, `rematch`. Live: `/ws?go=<code>` sends `{type: "go", state}` after every change; the lobby socket sends `golist`.
+- **Holding a match:** a web seat holds its match until it withdraws or moves on to a rematch, so a finished game stays on its page; after a restart, finished games only web seats hold are read from disk instead of kept in memory. A person has at most six unfinished games at once.
 
 ## For a resident
 

@@ -24,8 +24,19 @@ import type { BotPool } from './bots.js';
 
 export const GO = 'go';
 export type Phase = 'waiting' | 'playing' | 'scoring' | 'over';
+/** `opponent: 'agent'` (its name on the wire) is an open seat: an agent joins by code, or a person on the web page. */
 export interface GoSettings { size: number; komi: number; level: Level; opponent: 'bot' | 'agent' }
-type Seat = { kind: 'bot' } | { kind: 'agent'; sub: string; name: string; instance: string | null };
+/**
+ * Who sits in a seat: the bot; an agent playing through an instance of the go toolset (`instance`
+ * null once it closed it); or someone playing from the web page (`left` once they withdrew or moved
+ * on to a rematch). A web seat has no instance: the page is its surface, and it hears of moves by
+ * watching the match.
+ */
+type Seat = { kind: 'bot' } | { kind: 'agent'; sub: string; name: string; instance: string | null } | WebSeat;
+type WebSeat = { kind: 'web'; sub: string; name: string; left?: boolean };
+type PlayerSeat = Exclude<Seat, { kind: 'bot' }>;
+/** At most this many unfinished games per person on the web (each bot game runs searches). */
+export const WEB_SEATS_MAX = 6;
 
 const obj = (props: Record<string, unknown> = {}, required: string[] = []) => ({ type: 'object', properties: props, required, additionalProperties: false });
 const POINT = { type: 'string', pattern: '^[A-HJ-Ta-hj-t](1[0-9]|[1-9])$' };
@@ -60,7 +71,7 @@ export function goDeclaration() {
     options: obj({
       size: { enum: [9, 13, 19], default: 9 },
       color: { enum: ['black', 'white', 'random'], default: 'black' },
-      opponent: { enum: ['bot', 'agent'], default: 'bot', description: 'agent: the game waits for another agent to open go with {join: <its code>}.' },
+      opponent: { enum: ['bot', 'agent'], default: 'bot', description: 'agent: the game waits for an opponent — another agent opens go with {join: <its code>}, or a person joins on the web page.' },
       level: { enum: ['easy', 'medium', 'hard'], default: 'medium', description: 'The bot\'s strength (about 0.4 s, 1.5 s or 5 s a move on 9×9).' },
       komi: { type: 'number', minimum: 0, maximum: 15, default: 7.5 },
       join: { type: 'string', description: 'Join another agent\'s game by its code (game_list shows games waiting for an opponent). The game\'s settings are its creator\'s.' },
@@ -75,9 +86,12 @@ export class GoMatch {
   dead = new Set<number>();
   accepted = new Set<Color>();
   result?: string;
-  /** The code of a rematch offered from this game, while it waits. */
+  /** The code of the rematch played or offered from this game. */
   rematch?: string;
   createdAt = Date.now();
+  updatedAt = Date.now();
+  /** The bot is searching its reply (not persisted: a search does not survive a restart). */
+  thinking = false;
   private tail: Promise<unknown> = Promise.resolve();
 
   constructor(readonly code: string, readonly settings: GoSettings) { this.game = new GoGame(settings.size, settings.komi); }
@@ -91,9 +105,16 @@ export class GoMatch {
 
   isBot(c: Color): boolean { return this.seats[c]?.kind === 'bot'; }
   agent(c: Color): Extract<Seat, { kind: 'agent' }> | null { const s = this.seats[c]; return s?.kind === 'agent' ? s : null; }
+  web(c: Color): WebSeat | null { const s = this.seats[c]; return s?.kind === 'web' ? s : null; }
+  /** The agent or person in a seat (null: open, or the bot). */
+  player(c: Color): PlayerSeat | null { const s = this.seats[c]; return s && s.kind !== 'bot' ? s : null; }
+  /** The colour `sub` plays from the web page here, if any. */
+  webColor(sub: string): Color | null { return ([BLACK, WHITE] as Color[]).find((c) => this.web(c)?.sub === sub) ?? null; }
+  /** `sub` sits at this board, by either door. */
+  seated(sub: string): boolean { return ([BLACK, WHITE] as Color[]).some((c) => this.player(c)?.sub === sub); }
   label(c: Color, viewer?: Color): string {
     const s = this.seats[c];
-    const who = !s ? 'open seat' : s.kind === 'bot' ? `bot, ${this.settings.level}` : s.name;
+    const who = !s ? 'open seat' : s.kind === 'bot' ? `bot, ${this.settings.level}` : s.kind === 'web' ? `${s.name}, on the web` : s.name;
     return `${colorName(c)}${viewer === c ? ' (you)' : ''} [${who}]`;
   }
   score() { return areaScore(this.game.board, this.game.n, this.game.komi, this.dead); }
@@ -131,11 +152,15 @@ export class GoTables extends EventEmitter {
    */
   private ended = new Map<string, Array<{ id: string; instance: string; reason: string; at: number }>>();
 
-  constructor(private dir: string, private bots: BotPool, private log: (m: string) => void) {
+  /** `origin`: the web viewer's, for the page links agents can hand to people. */
+  constructor(private dir: string, private bots: BotPool, private log: (m: string) => void, private origin = '') {
     super();
     mkdirSync(dir, { recursive: true });
     this.load();
   }
+
+  /** A match's page on the web viewer. */
+  pageUrl(code: string): string { return `${this.origin}/go/${code}`; }
 
   // ---------------------------------------------------------------- lookup
 
@@ -151,7 +176,8 @@ export class GoTables extends EventEmitter {
   waiting(): GoMatch[] { return [...this.matches.values()].filter((m) => m.phase === 'waiting'); }
   describeWaiting(m: GoMatch): string {
     const c: Color = m.seats[BLACK] ? BLACK : WHITE;
-    return `${m.code} (${m.settings.size}×${m.settings.size}, komi ${m.settings.komi}: ${m.agent(c)?.name ?? '?'} as ${colorName(c)})`;
+    const s = m.player(c);
+    return `${m.code} (${m.settings.size}×${m.settings.size}, komi ${m.settings.komi}: ${s?.name ?? '?'}${s?.kind === 'web' ? ' (on the web)' : ''} as ${colorName(c)})`;
   }
 
   visible(r: GoRef): string[] {
@@ -181,7 +207,7 @@ export class GoTables extends EventEmitter {
   title(r: GoRef): string {
     const m = r.match;
     const opp = m.seats[other(r.color)];
-    const vs = !opp ? 'waiting for an opponent' : opp.kind === 'bot' ? `vs bot (${m.settings.level})` : `vs ${opp.name}`;
+    const vs = !opp ? 'waiting for an opponent' : opp.kind === 'bot' ? `vs bot (${m.settings.level})` : `vs ${opp.name}${opp.kind === 'web' ? ' (on the web)' : ''}`;
     return `Go ${m.game.n}×${m.game.n} — you are ${colorName(r.color)}, ${vs}`;
   }
 
@@ -195,7 +221,7 @@ export class GoTables extends EventEmitter {
     const lines = [renderBoard(g.board, g.n, { last: last?.point ?? undefined, dead: scoring ? m.dead : undefined, owner: sc?.owner })];
     lines.push(`${m.label(BLACK, r.color)} X, captured ${g.captures[BLACK]} · ${m.label(WHITE, r.color)} O, captured ${g.captures[WHITE]} · move ${g.moves.length} · komi ${g.komi}`);
     if (last) lines.push(`Last: ${colorName(last.color)} ${last.point === null ? 'passed' : `played ${pointName(last.point, g.n)}${last.captured ? `, capturing ${last.captured}` : ''}`}.`);
-    if (m.phase === 'waiting') lines.push(`Waiting for an opponent: they open the go toolset with options {join: "${m.code}"}.`);
+    if (m.phase === 'waiting') lines.push(`Waiting for an opponent: an agent opens the go toolset with options {join: "${m.code}"}; a person joins at ${this.pageUrl(m.code)}.`);
     if (m.phase === 'playing') lines.push(g.toMove === r.color ? 'Your move.' : `${colorName(g.toMove)} to move.`);
     if (sc) {
       lines.push(`Score as marked: ${sc.text}`);
@@ -239,33 +265,24 @@ export class GoTables extends EventEmitter {
       const note = given.length ? `${name} was already open; the options you gave (${given.join(', ')}) were not applied.` : `${name} was already open.`;
       return { ref: existing, adopted: true, text: `${note}\n${this.view(existing)}` };
     }
-    const change: GoChange = { cause, subs: [p.sub], events: [], suggest: [] };
+    const seat: PlayerSeat = { kind: 'agent', sub: p.sub, name: p.name, instance: name };
     if (typeof o.join === 'string') {
-      const m = this.matches.get(o.join.trim().toUpperCase());
-      if (!m || m.phase !== 'waiting') throw new Fault(400, m ? `Game ${m.code} has already started.` : `No game is waiting with the code "${o.join}"; game_list shows the open ones.`);
-      const ref = await m.lock(async () => {
-        if (m.phase !== 'waiting') throw new Fault(400, `Game ${m.code} has already started.`);
-        const free: Color = m.seats[BLACK] ? WHITE : BLACK;
-        m.seats[free] = { kind: 'agent', sub: p.sub, name: p.name, instance: name };
-        m.phase = 'playing';
-        this.save(m);
-        const creator = m.agent(other(free));
-        if (creator?.instance) {
-          const theirs = m.game.toMove !== free;
-          change.subs.push(creator.sub);
-          this.event(change, creator, `${p.name} joined as ${colorName(free)}.${theirs ? ' Your move.' : ' They move first.'}`, theirs ? ['surface:turn', 'go:start'] : ['go:start'], { name: creator.instance, match: m, color: other(free) });
-        }
-        return { name, match: m, color: free } as GoRef;
-      });
-      this.emitChange(change);
+      const { match, color } = await this.join(o.join, seat, cause);
+      const ref: GoRef = { name, match, color };
       return { ref, adopted: false, text: `${this.title(ref)}.\n${this.view(ref)}` };
     }
+    const { match, color, lead } = await this.create(seat, o, cause);
+    const ref: GoRef = { name, match, color };
+    return { ref, adopted: false, text: [`${this.title(ref)}.`, lead, this.view(ref)].filter(Boolean).join('\n') };
+  }
+
+  /** A new match with `seat` in it: against the bot (playing at once), or waiting for an opponent. */
+  private async create(seat: PlayerSeat, o: Record<string, unknown>, cause?: unknown): Promise<{ match: GoMatch; color: Color; lead: string }> {
     const settings: GoSettings = { size: Number(o.size ?? 9), komi: Number(o.komi ?? 7.5), level: (o.level as Level) ?? 'medium', opponent: (o.opponent as 'bot' | 'agent') ?? 'bot' };
     const m = new GoMatch(this.newCode(), settings);
     const color: Color = o.color === 'white' ? WHITE : o.color === 'random' ? (Math.random() < 0.5 ? BLACK : WHITE) : BLACK;
-    m.seats[color] = { kind: 'agent', sub: p.sub, name: p.name, instance: name };
+    m.seats[color] = seat;
     this.matches.set(m.code, m);
-    const ref: GoRef = { name, match: m, color };
     let lead = '';
     await m.lock(async () => {
       if (settings.opponent === 'bot') {
@@ -275,8 +292,32 @@ export class GoTables extends EventEmitter {
       }
       this.save(m);
     });
+    this.emitChange({ cause, subs: [seat.sub], events: [], suggest: [] });
+    return { match: m, color, lead };
+  }
+
+  /** `seat` takes the empty seat of a waiting match; its creator, if an agent, hears of it. */
+  private async join(code: string, seat: PlayerSeat, cause?: unknown): Promise<{ match: GoMatch; color: Color }> {
+    const m = this.matches.get(code.trim().toUpperCase());
+    if (!m || m.phase !== 'waiting') throw new Fault(400, m ? `Game ${m.code} has already started.` : `No game is waiting with the code "${code}"; game_list shows the open ones.`);
+    const change: GoChange = { cause, subs: [seat.sub], events: [], suggest: [] };
+    const color = await m.lock(async () => {
+      if (m.phase !== 'waiting') throw new Fault(400, `Game ${m.code} has already started.`);
+      const free: Color = m.seats[BLACK] ? WHITE : BLACK;
+      m.seats[free] = seat;
+      m.phase = 'playing';
+      this.save(m);
+      const creator = m.agent(other(free));
+      if (creator?.instance) {
+        const theirs = m.game.toMove !== free;
+        change.subs.push(creator.sub);
+        const who = `${seat.name}${seat.kind === 'web' ? ' (on the web)' : ''}`;
+        this.event(change, creator, `${who} joined as ${colorName(free)}.${theirs ? ' Your move.' : ' They move first.'}`, theirs ? ['surface:turn', 'go:start'] : ['go:start'], { name: creator.instance, match: m, color: other(free) });
+      }
+      return free;
+    });
     this.emitChange(change);
-    return { ref, adopted: false, text: [`${this.title(ref)}.`, lead, this.view(ref)].filter(Boolean).join('\n') };
+    return { match: m, color };
   }
 
   /** Close an instance (the host's act): a waiting game is withdrawn; leaving a live game against an agent forfeits it. */
@@ -298,6 +339,118 @@ export class GoTables extends EventEmitter {
       this.emitChange(change);
       return said;
     });
+  }
+
+  // ---------------------------------------------------------------- the web page
+  //
+  // A person plays from the viewer: a web seat, no instance. Its actions are the toolset's tools,
+  // run by the same code under the same lock, so an agent across the board hears of them exactly as
+  // it hears of another agent's. The page learns of every change from 'match' (the code), emitted
+  // whenever a match is saved or removed.
+
+  private webSeat(p: Principal): WebSeat { return { kind: 'web', sub: p.sub, name: p.name }; }
+  private webUnfinished(sub: string): number {
+    let k = 0;
+    for (const m of this.matches.values()) { const c = m.webColor(sub); if (c !== null && !m.web(c)!.left && m.phase !== 'over') k++; }
+    return k;
+  }
+  private webRoom(sub: string) {
+    if (this.webUnfinished(sub) >= WEB_SEATS_MAX) throw new Fault(429, `You have ${WEB_SEATS_MAX} unfinished games; finish or resign one first.`);
+  }
+
+  /** A new game started on the web page: against the bot, or waiting for an opponent (`opponent: 'agent'`). */
+  async webCreate(p: Principal, o: Record<string, unknown>): Promise<GoMatch> {
+    const bad = optionsProblem(o) ?? (o.join !== undefined ? 'join is not an option here: join the game from its page' : null);
+    if (bad) throw new Fault(400, `Invalid options: ${bad}.`);
+    this.webRoom(p.sub);
+    return (await this.create(this.webSeat(p), o)).match;
+  }
+
+  /** The empty seat of a waiting game, taken from the web page. */
+  async webJoin(p: Principal, code: string): Promise<GoMatch> {
+    if (this.matches.get(code.toUpperCase())?.seated(p.sub)) throw new Fault(400, 'You are already playing in this game.');
+    this.webRoom(p.sub);
+    return (await this.join(code, this.webSeat(p))).match;
+  }
+
+  /** One of the toolset's tools, for the web seat `p` holds in the match `code`. */
+  async webCall(p: Principal, code: string, tool: string, a: Record<string, unknown>): Promise<Out> {
+    if (!isGoTool(tool)) throw new Fault(400, `No action ${tool}.`);
+    const m = this.matches.get(code.toUpperCase());
+    if (!m) throw new Fault(404, 'That game is not being played.');
+    return m.lock(async () => {
+      const color = m.webColor(p.sub);
+      if (color === null || m.web(color)!.left) return fail('You are not playing in this game.');
+      const ref: GoRef = { name: m.code, match: m, color };
+      const why = this.unavailable(ref, tool);
+      if (why) return fail(why);
+      const change: GoChange = { subs: [p.sub], events: [], suggest: [] };
+      const out = await this.run(ref, tool, a, change);
+      this.emitChange(change);
+      return out;
+    });
+  }
+
+  /** A match by code: one in play, or one finished and retired (read from disk; `live` false). */
+  lookup(code: string): { match: GoMatch; live: boolean } | null {
+    const c = code.toUpperCase();
+    if (!/^[0-9A-F]{6}$/.test(c)) return null;
+    const m = this.matches.get(c);
+    if (m) return { match: m, live: true };
+    try { return { match: this.revive(JSON.parse(readFileSync(this.file(c), 'utf8'))), live: false }; } catch { return null; }
+  }
+
+  /** The match as the page draws it. `viewer` sees their own seat and what they can do in it now. */
+  webState(m: GoMatch, viewer: string | null, live = true) {
+    const g = m.game;
+    const key = (c: Color) => (c === BLACK ? 'black' : 'white');
+    const seat = (c: Color) => {
+      const s = m.seats[c];
+      return !s ? null : s.kind === 'bot' ? { kind: 'bot', name: `Bot (${m.settings.level})` } : { kind: s.kind, name: s.name, sub: s.sub };
+    };
+    const you = viewer ? m.webColor(viewer) : null;
+    const gone = you !== null && !!m.web(you)!.left;
+    const scoring = m.phase === 'scoring' || (m.phase === 'over' && m.dead.size > 0);
+    const sc = scoring ? m.score() : null;
+    return {
+      code: m.code, url: this.pageUrl(m.code), live, size: g.n, komi: g.komi, level: m.settings.level, opponent: m.settings.opponent,
+      phase: m.phase, result: m.result ?? null, rematch: m.rematch ?? null, thinking: m.thinking,
+      seats: { black: seat(BLACK), white: seat(WHITE) },
+      board: Array.from(g.board), toMove: key(g.toMove), passes: g.passes,
+      moves: g.moves.map((mv) => ({ color: key(mv.color), p: mv.point, point: mv.point === null ? null : pointName(mv.point, g.n), captured: mv.captured })),
+      captures: { black: g.captures[BLACK], white: g.captures[WHITE] },
+      dead: scoring ? [...m.dead] : [], owner: sc ? Array.from(sc.owner) : null,
+      score: sc ? { black: sc.black, white: sc.white, komi: sc.komi, text: sc.text } : null,
+      accepted: [...m.accepted].map(key),
+      you: you === null ? null : key(you), left: gone,
+      actions: live && you !== null && !gone ? this.visible({ name: m.code, match: m, color: you }) : [],
+      joinable: live && m.phase === 'waiting' && !!viewer && !m.seated(viewer),
+      createdAt: m.createdAt, updatedAt: m.updatedAt,
+    };
+  }
+
+  /** The lobby's Go list: games waiting for an opponent, games in play, games recently finished. */
+  webList(viewer: string | null) {
+    const key = (c: Color) => (c === BLACK ? 'black' : 'white');
+    const name = (m: GoMatch, c: Color) => { const s = m.seats[c]; return !s ? null : s.kind === 'bot' ? `Bot (${m.settings.level})` : s.name; };
+    const row = (m: GoMatch) => {
+      const you = viewer ? m.webColor(viewer) : null;
+      const mine = you !== null && !m.web(you)!.left;
+      return {
+        code: m.code, size: m.game.n, komi: m.game.komi, phase: m.phase, result: m.result ?? null,
+        black: name(m, BLACK), white: name(m, WHITE), moves: m.game.moves.length, toMove: key(m.game.toMove),
+        you: mine ? key(you!) : null,
+        yourTurn: mine && ((m.phase === 'playing' && m.game.toMove === you) || (m.phase === 'scoring' && !m.accepted.has(you!))),
+        joinable: m.phase === 'waiting' && !!viewer && !m.seated(viewer),
+        updatedAt: m.updatedAt,
+      };
+    };
+    const all = [...this.matches.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+    return {
+      waiting: all.filter((m) => m.phase === 'waiting').map(row),
+      playing: all.filter((m) => m.phase === 'playing' || m.phase === 'scoring').map(row),
+      finished: all.filter((m) => m.phase === 'over').slice(0, 12).map(row),
+    };
   }
 
   // ---------------------------------------------------------------- calls
@@ -351,10 +504,11 @@ export class GoTables extends EventEmitter {
         return ok(`Took back ${back + 1} move${back ? 's' : ''}.`, this.view(r));
       }
       case 'go_cancel': {
-        const sub = m.agent(me)!.sub;
+        const agent = m.agent(me);
         this.withdraw(m); this.leave(m, me);
+        if (!agent) return ok('Withdrawn: nobody had joined.');
         // The call's result reports the instance closing; the record is kept as well (RFC-014 r5 §5.3).
-        this.recordEnd(sub, r.name, `go-${m.code}-${r.name}`, `withdrawn with go_cancel before anyone joined (${m.code})`);
+        this.recordEnd(agent.sub, r.name, `go-${m.code}-${r.name}`, `withdrawn with go_cancel before anyone joined (${m.code})`);
         return ok('Withdrawn: nobody had joined. The instance is closed.');
       }
       case 'go_mark_dead': {
@@ -406,7 +560,9 @@ export class GoTables extends EventEmitter {
 
   private async botMove(m: GoMatch): Promise<string> {
     const g = m.game; const c = g.toMove;
-    const mv = await this.bots.move(g, m.settings.level);
+    m.thinking = true; this.emit('match', m.code);
+    let mv: Awaited<ReturnType<BotPool['move']>>;
+    try { mv = await this.bots.move(g, m.settings.level); } finally { m.thinking = false; }
     if (mv.resign) { m.phase = 'over'; m.result = `${c === BLACK ? 'W' : 'B'}+R`; this.save(m); return `${colorName(c)} (bot) resigns — you win (${m.result}).`; }
     if (mv.point === null) {
       g.pass(); this.save(m);
@@ -445,13 +601,16 @@ export class GoTables extends EventEmitter {
   /** Against the bot: a new game at once, colours swapped. Against an agent: offer one, or take theirs. */
   private async rematch(r: GoRef, change: GoChange): Promise<Out> {
     const m = r.match; const me = r.color; const opp = other(me);
-    const mine = m.agent(me)!;
+    const mine = m.player(me)!;
+    // The same player in the next match: an agent keeps its instance name, a web seat is a new one.
+    const carried = (): PlayerSeat => mine.kind === 'agent' ? { kind: 'agent', sub: mine.sub, name: mine.name, instance: r.name } : { kind: 'web', sub: mine.sub, name: mine.name };
     if (m.isBot(opp)) {
       const next = new GoMatch(this.newCode(), m.settings);
-      next.seats[opp] = { kind: 'agent', sub: mine.sub, name: mine.name, instance: r.name };
+      next.seats[opp] = carried();
       next.seats[me] = { kind: 'bot' };
       next.phase = 'playing';
       this.matches.set(next.code, next);
+      m.rematch = next.code;
       this.leave(m, me);
       const ref: GoRef = { name: r.name, match: next, color: opp };
       const lead = next.game.toMove !== opp ? await next.lock(() => this.botMove(next)) : '';
@@ -461,7 +620,7 @@ export class GoTables extends EventEmitter {
     const offer = m.rematch ? this.matches.get(m.rematch) : undefined;
     if (offer && offer.phase === 'waiting') {
       const free: Color = offer.seats[BLACK] ? WHITE : BLACK;
-      offer.seats[free] = { kind: 'agent', sub: mine.sub, name: mine.name, instance: r.name };
+      offer.seats[free] = carried();
       offer.phase = 'playing';
       this.leave(m, me);
       this.save(offer);
@@ -475,7 +634,7 @@ export class GoTables extends EventEmitter {
       return ok(`Rematch on: you are ${colorName(free)}.${offer.game.toMove === free ? ' Your move.' : ''}`, this.view(ref));
     }
     const next = new GoMatch(this.newCode(), m.settings);
-    next.seats[opp] = { kind: 'agent', sub: mine.sub, name: mine.name, instance: r.name };
+    next.seats[opp] = carried();
     this.matches.set(next.code, next);
     m.rematch = next.code;
     this.leave(m, me);
@@ -503,11 +662,12 @@ export class GoTables extends EventEmitter {
 
   private emitChange(change: GoChange) { this.emit('change', change); }
 
-  /** A player's instance leaves the match; a match nobody holds any more is retired (kept on disk). */
+  /** A player leaves the match (an agent's instance closes; a web seat withdraws or moves to a rematch); a match nobody holds any more is retired (kept on disk). */
   private leave(m: GoMatch, c: Color) {
-    const s = m.agent(c);
-    if (s) s.instance = null;
-    if ([BLACK, WHITE].some((x) => m.agent(x as Color)?.instance)) { this.save(m); return; }
+    const s = m.seats[c];
+    if (s?.kind === 'agent') s.instance = null;
+    else if (s?.kind === 'web') s.left = true;
+    if (held(m)) { this.save(m); return; }
     this.matches.delete(m.code);
     if (m.phase === 'waiting') this.remove(m); else this.save(m, true);
   }
@@ -533,20 +693,36 @@ export class GoTables extends EventEmitter {
 
   private file(code: string) { return join(this.dir, `${code}.json`); }
 
+  /** Every save and removal is a change the web page shows ('match', with the code). */
   private save(m: GoMatch, retired = false) {
     const seat = (c: Color) => m.seats[c];
+    m.updatedAt = Date.now();
     try {
       writeFileSync(this.file(m.code), JSON.stringify({
         code: m.code, settings: m.settings, phase: m.phase, result: m.result ?? null, rematch: m.rematch ?? null,
         seats: { black: seat(BLACK), white: seat(WHITE) }, game: m.game.toJSON(), dead: [...m.dead], accepted: [...m.accepted],
-        createdAt: m.createdAt, updatedAt: Date.now(), ...(retired ? { retired: true } : {}),
+        createdAt: m.createdAt, updatedAt: m.updatedAt, ...(retired ? { retired: true } : {}),
       }));
     } catch (e) { this.log(`go: could not save ${m.code}: ${(e as Error).message}`); }
+    this.emit('match', m.code);
   }
 
-  private remove(m: GoMatch) { try { unlinkSync(this.file(m.code)); } catch { /* gone */ } }
+  private remove(m: GoMatch) { try { unlinkSync(this.file(m.code)); } catch { /* gone */ } this.emit('match', m.code); }
 
-  /** Matches someone still holds come back after a restart, with their instances. */
+  private revive(j: any): GoMatch {
+    const m = new GoMatch(j.code, j.settings);
+    m.game = GoGame.fromJSON(j.game);
+    m.seats = { [BLACK]: j.seats.black ?? null, [WHITE]: j.seats.white ?? null } as Record<Color, Seat | null>;
+    m.phase = j.phase; m.result = j.result ?? undefined; m.rematch = j.rematch ?? undefined;
+    m.dead = new Set(j.dead ?? []); m.accepted = new Set(j.accepted ?? []);
+    m.createdAt = j.createdAt ?? Date.now(); m.updatedAt = j.updatedAt ?? m.createdAt;
+    return m;
+  }
+
+  /**
+   * Matches someone still holds come back after a restart, with their instances. A finished game
+   * only web seats hold stays on disk (its page still shows it) rather than in memory.
+   */
   private load() {
     if (!existsSync(this.dir)) return;
     for (const f of readdirSync(this.dir)) {
@@ -554,16 +730,19 @@ export class GoTables extends EventEmitter {
       try {
         const j = JSON.parse(readFileSync(join(this.dir, f), 'utf8'));
         if (j.retired) continue;
-        const m = new GoMatch(j.code, j.settings);
-        m.game = GoGame.fromJSON(j.game);
-        m.seats = { [BLACK]: j.seats.black ?? null, [WHITE]: j.seats.white ?? null } as Record<Color, Seat | null>;
-        m.phase = j.phase; m.result = j.result ?? undefined; m.rematch = j.rematch ?? undefined;
-        m.dead = new Set(j.dead ?? []); m.accepted = new Set(j.accepted ?? []); m.createdAt = j.createdAt ?? Date.now();
+        const m = this.revive(j);
+        if (m.phase === 'over' && !([BLACK, WHITE] as Color[]).some((c) => m.agent(c)?.instance)) continue;
+        if (!held(m)) continue;
         this.matches.set(m.code, m);
       } catch (e) { this.log(`go: could not load ${f}: ${(e as Error).message}`); }
     }
     if (this.matches.size) this.log(`go: ${this.matches.size} game(s) back from disk`);
   }
+}
+
+/** Someone still holds the match: an agent's open instance, or a web seat that has not left. */
+function held(m: GoMatch): boolean {
+  return ([BLACK, WHITE] as Color[]).some((c) => { const s = m.seats[c]; return s?.kind === 'agent' ? !!s.instance : s?.kind === 'web' ? !s.left : false; });
 }
 
 function optionsProblem(o: Record<string, unknown>): string | null {
