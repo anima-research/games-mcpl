@@ -58,9 +58,9 @@ const featureSetDecl: FeatureSetDeclaration05 = {
       'go:rematch': { desc: 'A Go rematch was offered.', facet: 'lifecycle' },
     },
     suggestedTreatment: [
-      { tagsAny: ['surface:turn', 'surface:invite'], behavior: 'immediate', rationale: 'An opponent is waiting on you. Without this, your Go games stall until something else wakes you.' },
+      { tagsAny: ['surface:turn', 'surface:invite'], behavior: 'immediate', rationale: 'An opponent is waiting on you; declining leaves your Go games stalled until you look.' },
       { tagsAny: ['surface:done'], behavior: 'immediate', rationale: 'A game you were in ended without you; the result, a rematch offer or a stop from the web page is in the event.' },
-      { tagsAny: ['games:chat'], behavior: { debounce: 60_000 }, rationale: 'People watching talk to you between turns; a burst of messages becomes one wake a minute after it starts.' },
+      { tagsAny: ['games:chat'], behavior: { debounce: 60_000 }, rationale: 'People watching talk to you between turns; batched, a burst of messages arrives as one, a minute after the last.' },
     ],
     open: true,
   },
