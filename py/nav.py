@@ -14,6 +14,7 @@ reads heights live.
 """
 import heapq
 import math
+import struct
 
 PLAYER_RADIUS = 16
 WALL_MARGIN = 24      # keep cell centres this far from walls: the 32×32 box also has to clear corners
@@ -36,6 +37,38 @@ def _seg_dist(px, py, x1, y1, x2, y2):
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
+def same_sector_lines(wad_path, map_name):
+    """Keys of the map's lines that have the same sector on both sides, read from the WAD.
+
+    The engine lists such a line once in its sector, like a wall with nothing behind it, and does not
+    say which it is. A fill by scanline parity has to leave these lines out: counted as boundary they
+    turn the sector inside out (Doom E1M1's last room has six of them). Returns an empty set for
+    anything that is not a plain Doom-format map."""
+    try:
+        with open(wad_path, "rb") as f:
+            data = f.read()
+        count, table = struct.unpack_from("<ii", data, 4)
+        lumps = [(struct.unpack_from("<ii", data, table + 16 * i), data[table + 16 * i + 8:table + 16 * i + 16].rstrip(b"\0").decode("ascii", "replace").upper())
+                 for i in range(count)]
+        at = next(i for i, (_, name) in enumerate(lumps) if name == map_name.upper())
+        level = {name: where for where, name in lumps[at + 1:at + 11]}
+
+        def records(name, fmt):
+            pos, size = level[name]
+            step = struct.calcsize(fmt)
+            return [struct.unpack_from(fmt, data, pos + step * k) for k in range(size // step)]
+        vertexes = records("VERTEXES", "<hh")
+        sides = records("SIDEDEFS", "<hh8s8s8sH")
+        out = set()
+        for v1, v2, _flags, _special, _tag, right, left in records("LINEDEFS", "<HHHHHHH"):
+            if right == 0xFFFF or left == 0xFFFF or sides[right][5] != sides[left][5]:
+                continue
+            out.add(tuple(sorted((vertexes[v1], vertexes[v2]))))
+        return out
+    except Exception:
+        return set()
+
+
 class Edge:
     __slots__ = ("a", "b", "mx", "my", "length", "key")
 
@@ -44,20 +77,24 @@ class Edge:
 
 
 class NavMap:
-    def __init__(self, sectors):
+    def __init__(self, sectors, inner=()):
+        """`inner`: keys of lines with the same sector on both sides (see same_sector_lines)."""
+        inner = set(inner)
         self.n = len(sectors)
         self.polys = []
         self.centroids = []
         self.edges = {}
         self.lines = {}
         for i, sec in enumerate(sectors):
-            pts = [(ln.x1, ln.y1, ln.x2, ln.y2) for ln in sec.lines]
+            every = [(ln.x1, ln.y1, ln.x2, ln.y2) for ln in sec.lines]
+            pts = [(ln.x1, ln.y1, ln.x2, ln.y2) for ln in sec.lines if _key(ln) not in inner]   # the outline, for the fill
             self.polys.append(pts)
-            xs = [p[0] for p in pts] + [p[2] for p in pts]
-            ys = [p[1] for p in pts] + [p[3] for p in pts]
+            xs = [p[0] for p in every] + [p[2] for p in every]
+            ys = [p[1] for p in every] + [p[3] for p in every]
             self.centroids.append((sum(xs) / max(1, len(xs)), sum(ys) / max(1, len(ys))))
             for ln in sec.lines:
-                e = self.lines.setdefault(_key(ln), {"sectors": set(), "blocking": bool(ln.is_blocking), "pts": (ln.x1, ln.y1, ln.x2, ln.y2)})
+                e = self.lines.setdefault(_key(ln), {"sectors": set(), "blocking": bool(ln.is_blocking), "pts": (ln.x1, ln.y1, ln.x2, ln.y2),
+                                                    "inner": _key(ln) in inner})
                 e["sectors"].add(i)
         for key, e in self.lines.items():
             if len(e["sectors"]) != 2 or e["blocking"]:
@@ -72,10 +109,21 @@ class NavMap:
             self.edges.setdefault(b, []).append(Edge(b, a, mx, my, length, key))
         # doors: closed (no headroom) at episode start, few lines, two walkable neighbours
         self.door_like = set()
+        self.locked = set()   # doors that would not open when tried; not routed through while they stay shut
         for i, sec in enumerate(sectors):
             nb = {e.b for e in self.edges.get(i, [])}
             if sec.ceiling_height - sec.floor_height < MIN_GAP and len(nb) >= 2 and len(self.polys[i]) <= 8:
                 self.door_like.add(i)
+        # slivers: areas too shallow to stand in (the recess in front of a door, a sill). Whatever lies
+        # just behind one is, for the player, right there.
+        self.sliver = set()
+        for i, pts in enumerate(self.polys):
+            if i in self.door_like or not pts:
+                continue
+            xs = [p[0] for p in pts] + [p[2] for p in pts]
+            ys = [p[1] for p in pts] + [p[3] for p in pts]
+            if min(max(xs) - min(xs), max(ys) - min(ys)) < MIN_DOORWAY:
+                self.sliver.add(i)
         self._build_grid(sectors)
 
     # ── grid ──
@@ -111,7 +159,7 @@ class NavMap:
         # walls: cells whose centre is within the player's radius of a blocking line
         self.wall = bytearray(W * H)
         for e in self.lines.values():
-            if len(e["sectors"]) >= 2 and not e["blocking"]:
+            if (len(e["sectors"]) >= 2 or e["inner"]) and not e["blocking"]:
                 continue
             x1, y1, x2, y2 = e["pts"]
             c0 = max(0, int((min(x1, x2) - WALL_MARGIN - self.x0) // CELL))
@@ -144,7 +192,8 @@ class NavMap:
             return False
         sec = sectors[s]
         if sec.ceiling_height - sec.floor_height < MIN_GAP:
-            return s in self.door_like
+            return s in self.door_like and s not in self.locked
+        self.locked.discard(s)
         return True
 
     def _can_step(self, a, b, sectors):
@@ -317,15 +366,31 @@ class NavMap:
             return "step down"
         return "opening"
 
+    def door_edges(self, here):
+        """Edges into door-like sectors from `here`, and from the slivers `here` opens onto."""
+        for e in self.edges.get(here, []):
+            if e.b in self.door_like:
+                yield e
+            elif e.b in self.sliver:
+                for e2 in self.edges.get(e.b, []):
+                    if e2.b in self.door_like:
+                        yield e2
+
     def openings(self, here, px, py, sectors, visited):
         out = []
         for e in self.edges.get(here, []):
             if sectors[e.b].floor_height - sectors[here].floor_height > MAX_STEP and e.b not in self.door_like:
                 continue
+            via = here
+            if e.b in self.sliver:
+                # a door set back in a shallow recess is a door, not an "opening" 8 units deep
+                behind = [x for x in self.edges.get(e.b, []) if x.b in self.door_like]
+                if behind:
+                    via, e = e.b, behind[0]
             far = e.b
             explored = far in visited
             if far in self.door_like:
-                beyond = [x.b for x in self.edges.get(far, []) if x.b != here]
+                beyond = [x.b for x in self.edges.get(far, []) if x.b not in (here, via)]
                 explored = any(b in visited for b in beyond)
             out.append({"kind": self.step_kind(here, e.b, sectors), "x": e.mx, "y": e.my, "sector": far, "explored": explored,
                         "width": int(e.length), "distance": math.hypot(e.mx - px, e.my - py)})
@@ -347,7 +412,7 @@ class NavMap:
             if n > limit_nodes:
                 return None
             s = self.cell_sector[cur]
-            if s not in visited and s not in self.door_like and cur != start:
+            if s not in visited and s not in self.door_like and s not in self.sliver and cur != start:
                 # take a cell a little inside the area, not the first border cell
                 return cur, s
             for j, _ in self.neighbors(cur, sectors):

@@ -102,6 +102,7 @@ node --import tsx test/hints.ts                                       # RFC-014 
 node --import tsx test/go.ts                                          # Go end to end: bot game, two identities, restart (starts its own server on :7394)
 npm test                                                              # unit tests (test/*.test.ts): hints, Go rules, the bot pool
 py/.venv/bin/python -I test/autosave.py                               # the autosave never moves the world
+py/.venv/bin/python -I test/nav.py                                    # the planner's map matches the level (E1M1 part needs doom.wad)
 ```
 
 | env | default | |

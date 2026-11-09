@@ -27,7 +27,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nav import NavMap, compass  # noqa: E402
+from nav import NavMap, same_sector_lines, compass  # noqa: E402
 
 try:
     import vizdoom as vzd
@@ -202,7 +202,7 @@ class Doom:
             self.turns = int(turn or 0)
             events = [f"Resumed {game} {map} from the autosave (turn {self.turns}) after a server restart — carry on."]
         st = self.g.get_state()
-        self.nav = NavMap(st.sectors) if st is not None and st.sectors else None
+        self.nav = NavMap(st.sectors, same_sector_lines(GAMES[game]["wad"], map)) if st is not None and st.sectors else None
         self.visited = set(int(v) for v in (visited or []))
         self.gave_up = {int(k): int(v) for k, v in (gave_up or {}).items()}
         self._mark_visited(st)
@@ -738,7 +738,13 @@ class Doom:
             s = self.g.get_state()
             door = self._nearest_door_line(s) if s is not None else None
             if door is not None:
-                ok, r = self._open_door(door.b, door.mx, door.my, stop_on, watch)
+                # aim square at the door: the nearest point of its line, not its middle seen from the side
+                (x1, y1), (x2, y2) = door.key
+                px, py = self._pos()
+                L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2
+                inset = min(0.5, 16 / math.sqrt(L2)) if L2 else 0.5
+                f = max(inset, min(1 - inset, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / L2)) if L2 else 0.5
+                ok, r = self._open_door(door.b, x1 + f * (x2 - x1), y1 + f * (y2 - y1), stop_on, watch)
                 if ok:
                     return "use: door opened", None
                 return "use: door did not open", r
@@ -750,9 +756,15 @@ class Doom:
             moved = 0
             if before is not None and s2 is not None:
                 moved = sum(1 for a, sec in zip(before, s2.sectors) if (sec.floor_height, sec.ceiling_height) != a)
+            opened = [i for i in self.nav.door_like if before is not None and s2 is not None and i < len(before)
+                      and s2.sectors[i].ceiling_height - s2.sectors[i].floor_height > before[i][1] - before[i][0]] if self.nav else []
+            if opened:
+                events.append("use: a door is opening.")
+                return "use: door opening", r
             if moved:
-                events.append(f"use: something moved ({moved} sector(s) changed height) — a switch worked.")
-                return "use: switch pressed, something moved", r
+                # doors close and lifts return on their own timers, so this may not be the press
+                events.append(f"use: something is moving ({moved} area(s) changed height) — a switch here, or a door or lift on its own timer.")
+                return "use: pressed, something is moving", r
             events.append("use: nothing here to use — no door within reach in front of you and nothing moved. Doors are listed under 'Openings'; stand within ~60 units facing one.")
             return "use: nothing happened", r
         if "weapon" in action:
@@ -792,9 +804,11 @@ class Doom:
                 r = self._turn(b, stop_on, watch)
                 if r:
                     return used, r, False
-            r = self._step(self._press(MOVE_FORWARD=1, SPEED=1 if run else 0), 5, stop_on, watch)
-            used += 5
-            no_progress += 5
+            # close to the point, check every tic or two: a 5-tic run covers ~80 units and sails past a 12-unit target
+            n = max(1, min(5, int(d // 16)))
+            r = self._step(self._press(MOVE_FORWARD=1, SPEED=1 if run else 0), n, stop_on, watch)
+            used += n
+            no_progress += n
             if r:
                 return used, r, False
             if no_progress >= 15:
@@ -805,6 +819,8 @@ class Doom:
     def _open_door(self, door_sector, mx, my, stop_on, watch):
         """Stand before the door line, press use, wait for it to rise. Returns (ok, reason)."""
         used, r, arrived = self._walk_to(mx, my, 36, 35 * 4, stop_on, watch)
+        if r == "replan":
+            return False, "could not get up to the door (something in the way)"
         if r:
             return False, r
         b, _ = self._bearing_to(mx, my)
@@ -848,7 +864,7 @@ class Doom:
                 legs = sum(1 for w in wps if w[0] == "walk")
                 desc_path = f"{legs} leg(s), {doors} door(s)" if cells is not None else "straight line"
             outcome = None   # "done" | "replan" | reason
-            for w in wps:
+            for k, w in enumerate(wps):
                 if used >= max_tics:
                     outcome = "time"
                     break
@@ -857,13 +873,18 @@ class Doom:
                     if self.nav.closed(dsec, self.g.get_state().sectors):
                         ok, r = self._open_door(dsec, dx, dy, stop_on, watch)
                         if not ok:
+                            if r and "would not open" in r:
+                                self.nav.locked.add(dsec)   # routes stop counting on it until it is seen open
                             return f"goto {what}: stopped at a door", r
                         doors_opened += 1
                         events.append("Opened a door.")
                     continue
                 _, wx, wy = w
                 last = w is wps[-1]
-                n, r, arrived = self._walk_to(wx, wy, within if last else 14, max_tics - used, stop_on, watch, run)
+                # the cell in front of a closed door can lie within the player's radius of the door's face,
+                # where nobody can stand: close is enough, the door step walks up to it
+                before_door = k + 1 < len(wps) and wps[k + 1][0] == "door"
+                n, r, arrived = self._walk_to(wx, wy, within if last else 34 if before_door else 14, max_tics - used, stop_on, watch, run)
                 used += n
                 if r == "replan":
                     outcome = "replan"
@@ -912,9 +933,7 @@ class Doom:
         px, py = self._pos()
         pa = float(self.g.get_game_variable(vzd.GameVariable.ANGLE))
         best = None
-        for e in self.nav.edges.get(here, []):
-            if e.b not in self.nav.door_like:
-                continue
+        for e in self.nav.door_edges(here):
             d = math.hypot(e.mx - px, e.my - py)
             rel = abs(ang_norm(math.degrees(math.atan2(e.my - py, e.mx - px)) - pa))
             if d <= max_dist and rel <= max_bearing and (best is None or d < best[0]):
