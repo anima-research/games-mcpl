@@ -8,6 +8,7 @@ export interface Observation {
   events: string[];
   status: Record<string, unknown> & { health?: number; armor?: number; weapon?: string; weapon_ammo?: number; ammo?: Record<string, number>; kills?: number; items?: number; secrets?: number; time_s?: number; note?: string };
   position?: { x: number; y: number; z: number; angle: number; facing?: string };
+  switches?: { kind: string; bearing: number; distance: number; x: number; y: number }[];
   openings?: { kind: string; bearing: number; distance: number; x: number; y: number; explored: boolean; width: number }[];
   explored?: { visited: number; total: number };
   visible?: { id: number; name: string; label: string; category: string; bearing: number; distance: number; px: number[] }[];

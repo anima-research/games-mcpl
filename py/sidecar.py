@@ -27,7 +27,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from nav import NavMap, same_sector_lines, compass  # noqa: E402
+from nav import NavMap, map_lines, compass  # noqa: E402
 
 try:
     import vizdoom as vzd
@@ -135,6 +135,7 @@ class Doom:
         self.nav = None       # NavMap for the current episode
         self.visited = set()  # sector ids the player has stood in
         self.gave_up = {}     # sector id -> failed explore attempts (2 = skip it)
+        self.switches = []    # the map's switches and exits (nav.map_lines)
         self.paused = False   # left paused by save(); the next turn's first tic (_tic) unpauses
 
     # ── lifecycle ──
@@ -202,7 +203,8 @@ class Doom:
             self.turns = int(turn or 0)
             events = [f"Resumed {game} {map} from the autosave (turn {self.turns}) after a server restart — carry on."]
         st = self.g.get_state()
-        self.nav = NavMap(st.sectors, same_sector_lines(GAMES[game]["wad"], map)) if st is not None and st.sectors else None
+        inner, self.switches = map_lines(GAMES[game]["wad"], map)
+        self.nav = NavMap(st.sectors, inner) if st is not None and st.sectors else None
         self.visited = set(int(v) for v in (visited or []))
         self.gave_up = {int(k): int(v) for k, v in (gave_up or {}).items()}
         self._mark_visited(st)
@@ -329,6 +331,12 @@ class Doom:
                 ops.append({"kind": o["kind"], "bearing": round(-rel), "distance": round(o["distance"]), "x": round(o["x"]), "y": round(o["y"]),
                             "explored": o["explored"], "width": o["width"]})
             out["openings"] = ops
+            sw = []
+            for w in self._switches_here(here):
+                rel = ang_norm(math.degrees(math.atan2(w["y"] - py, w["x"] - px)) - pa)
+                sw.append({"kind": w["kind"], "bearing": round(-rel), "distance": round(math.hypot(w["x"] - px, w["y"] - py)), "x": round(w["x"]), "y": round(w["y"])})
+            if sw:
+                out["switches"] = sorted(sw, key=lambda w: w["distance"])[:6]
             walkable = self.nav.n - len(self.nav.door_like)
             out["explored"] = {"visited": len(self.visited - self.nav.door_like), "total": walkable}
         # what is in view
@@ -403,6 +411,13 @@ class Doom:
         if me is not None and 0 <= me.sector_id < self.nav.n:
             return int(me.sector_id)
         return self.nav.point_sector(float(self.g.get_game_variable(vzd.GameVariable.POSITION_X)), float(self.g.get_game_variable(vzd.GameVariable.POSITION_Y)))
+
+    def _switches_here(self, here):
+        """Switches and exits on the walls of the area the player is in (and of the slivers it opens onto)."""
+        if self.nav is None or here is None:
+            return []
+        around = {here} | {e.b for e in self.nav.edges.get(here, []) if e.b in self.nav.sliver}
+        return [w for w in self.switches if w["sector"] in around]
 
     def _mark_visited(self, s=None):
         sec = self._player_sector(s)
@@ -748,10 +763,28 @@ class Doom:
                 if ok:
                     return "use: door opened", None
                 return "use: door did not open", r
-            # no door in reach: press anyway (switches), then say whether anything moved
+            # no door in reach: a switch of this area that is in front and near? walk up to it and face it
+            switch = None
+            if s is not None:
+                for w in self._switches_here(self._player_sector(s)):
+                    b, dist = self._bearing_to(w["x"], w["y"])
+                    if w["use"] and dist <= 256 and abs(b) <= 90 and (switch is None or dist < switch[0]):
+                        switch = (dist, w)
+            if switch is not None:
+                w = switch[1]
+                _, r, _ = self._walk_to(w["sx"], w["sy"], 12, 35 * 3, stop_on, watch)
+                if r and r != "replan":
+                    return f"use: on the way to the {w['kind']}", r
+                self._turn(self._bearing_to(w["x"], w["y"])[0], stop_on, watch)
+                s = self.g.get_state()
+            # press (also with nothing known in reach), then say whether anything moved
             before = [(sec.floor_height, sec.ceiling_height) for sec in s.sectors] if s is not None else None
             self._tic(self._press(USE=1), 2)
+            if self.g.is_episode_finished():
+                return f"use: {switch[1]['kind'] if switch else 'exit'} pressed", "level complete"
             r = self._step(self._press(), int(action.get("tics", 25)), stop_on, watch)
+            if self.g.is_episode_finished():
+                return f"use: {switch[1]['kind'] if switch else 'exit'} pressed", "level complete"
             s2 = self.g.get_state()
             moved = 0
             if before is not None and s2 is not None:
@@ -765,7 +798,10 @@ class Doom:
                 # doors close and lifts return on their own timers, so this may not be the press
                 events.append(f"use: something is moving ({moved} area(s) changed height) — a switch here, or a door or lift on its own timer.")
                 return "use: pressed, something is moving", r
-            events.append("use: nothing here to use — no door within reach in front of you and nothing moved. Doors are listed under 'Openings'; stand within ~60 units facing one.")
+            if switch is not None:
+                events.append(f"use: pressed the {switch[1]['kind']}; nothing moved that shows from here (it may work once only, or act somewhere else).")
+                return f"use: {switch[1]['kind']} pressed", r
+            events.append("use: nothing here to use — no door or switch within reach in front of you and nothing moved. Doors are listed under 'Ways out' and switches under 'Switches here'; face one from nearby.")
             return "use: nothing happened", r
         if "weapon" in action:
             n = int(action["weapon"])

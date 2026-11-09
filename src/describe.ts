@@ -29,6 +29,7 @@ export function describe(obs: Observation, session: GameSession, chat: ChatMessa
   if (obs.position) lines.push(`Position (${obs.position.x}, ${obs.position.y}) z ${obs.position.z}, facing ${obs.position.facing ?? ''} (${obs.position.angle}°; 0° = east, 90° = north).${obs.explored ? ` Explored ${obs.explored.visited} of ${obs.explored.total} areas.` : ''}`);
   if (obs.openings?.length) lines.push(`Ways out of this area: ${obs.openings.map((o) => `${o.kind} ${dir(o.bearing)}, ${o.distance} units at (${o.x}, ${o.y})${o.explored ? '' : ' → UNEXPLORED'}`).join(' · ')}.`);
   else if (obs.openings) lines.push('Ways out of this area: none walkable (dead end — look for a switch or go back).');
+  if (obs.switches?.length) lines.push(`Switches here: ${obs.switches.map((w) => `${w.kind} ${dir(w.bearing)}, ${w.distance} units at (${w.x}, ${w.y})`).join(' · ')}. Face one and {"use": true} walks up and presses it.`);
   if (obs.visible?.length) {
     const seen = obs.visible.slice(0, 14).map((o) => {
       const tag = o.category === 'monster' ? (obs.new_monsters?.includes(o.id) ? ' NEW' : '') : ` (${o.category})`;
@@ -54,7 +55,7 @@ export const ACTION_HELP = [
   '  {"goto": <object id> | [x,y], "within": 48}   — walks a real route there (around corners, through doors, opening them); stops on arrival, damage or a new enemy.',
   '  {"explore": true}                            — walk to the nearest area you have not visited yet (the usual way to find the exit).',
   '  {"attack": 2}                                 — fire N shots at whatever you face (hold until the ammo drops N times).',
-  '  {"use": true}                                 — open the nearest door in front of you (walks up to it) or press a switch; tells you if nothing happened.',
+  '  {"use": true}                                 — open the nearest door in front of you, or press the nearest switch of "Switches here" in front of you (walks up to it); tells you if nothing happened.',
   '  {"weapon": 3}                                 — 1 fist, 2 pistol, 3 shotgun, 4 chaingun, 5 rockets, 6 plasma, 7 BFG, 8 chainsaw.',
   '  {"wait": 35}                                  — stand still N tics (doors take ~30 tics to open).',
   'stop_on (default ["damage","enemy","dead","level"]) ends the sequence early so you can react; pass [] to run it all.',

@@ -4,6 +4,8 @@
 #     filled inside out, so the room was a hole in the map and nothing behind it was reachable;
 #   - a door set back in a recess too shallow to stand in was not found by `use`, nor listed
 #     under openings, because it does not border the area the player stands in.
+# And one thing it never told: where a room's switches are. The exit switch of E1M1 is on a
+# side wall of the exit room; the player is now told, and `use` walks up to it.
 # The first part needs no engine. The second plays the last stretch of E1M1 and is skipped
 # when doom.wad is not there (DOOM_WAD_DIR, default ./wads).
 #   py/.venv/bin/python -I test/nav.py
@@ -74,7 +76,10 @@ for turn in range(10):
         break
     obs = d.act([{"explore": True}], stop_on=["dead"], image="none")
 check(EXIT_ROOM in d.visited, f"E1M1: explore reaches the exit room ({turn} turns)")
-obs = d.act([{"goto": [2944, -4768]}, {"face": [2912, -4768]}, {"use": True}], stop_on=["level"], image="none")
-check(obs["finished"], "E1M1: the exit switch ends the level")
+obs = d.act([{"goto": [3008, -4700]}], stop_on=[], image="none")
+sw = obs.get("switches") or []
+check(len(sw) == 1 and sw[0]["kind"] == "exit switch" and (sw[0]["x"], sw[0]["y"]) == (2912, -4768), f"E1M1: the exit room lists its exit switch — {sw}")
+obs = d.act([{"turn": sw[0]["bearing"] + 40}, {"use": True}], stop_on=["level"], image="none")
+check(obs["finished"], "E1M1: `use`, roughly facing the exit switch, walks up to it and ends the level — " + obs["events"][0])
 d.close()
 print("all good")

@@ -37,13 +37,30 @@ def _seg_dist(px, py, x1, y1, x2, y2):
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
-def same_sector_lines(wad_path, map_name):
-    """Keys of the map's lines that have the same sector on both sides, read from the WAD.
+# Line specials a player sets off (Doom and Heretic numbering). Doors opened by hand are not here:
+# those are found as door sectors.
+EXIT_SWITCHES = {11: "exit switch", 51: "secret exit switch"}
+EXIT_LINES = {52: "exit (walk across the line)", 124: "secret exit (walk across the line)"}
+SWITCHES = {7, 9, 14, 15, 18, 20, 21, 23, 29, 41, 49, 50, 55, 71, 101, 102, 103, 111, 112, 113, 122, 127, 131, 133, 135, 137, 140,
+            42, 43, 45, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 99, 114, 115, 116, 123, 132, 134, 136, 138, 139}
+STAND_OFF = 28   # where to stand to press a switch: this far out from its line
 
-    The engine lists such a line once in its sector, like a wall with nothing behind it, and does not
-    say which it is. A fill by scanline parity has to leave these lines out: counted as boundary they
-    turn the sector inside out (Doom E1M1's last room has six of them). Returns an empty set for
-    anything that is not a plain Doom-format map."""
+
+def same_sector_lines(wad_path, map_name):
+    return map_lines(wad_path, map_name)[0]
+
+
+def map_lines(wad_path, map_name):
+    """What the WAD knows about the map's lines and the engine does not pass on: (inner, switches).
+
+    inner: keys of the lines that have the same sector on both sides. The engine lists such a line once
+    in its sector, like a wall with nothing behind it. A fill by scanline parity has to leave these
+    lines out: counted as boundary they turn the sector inside out (Doom E1M1's last room has six).
+
+    switches: the switches and exits, each {kind, use, sector, x, y, sx, sy}: the middle of the line,
+    the sector its front faces, and the point to stand on to press it.
+
+    Both empty for anything that is not a plain Doom-format map."""
     try:
         with open(wad_path, "rb") as f:
             data = f.read()
@@ -59,14 +76,21 @@ def same_sector_lines(wad_path, map_name):
             return [struct.unpack_from(fmt, data, pos + step * k) for k in range(size // step)]
         vertexes = records("VERTEXES", "<hh")
         sides = records("SIDEDEFS", "<hh8s8s8sH")
-        out = set()
-        for v1, v2, _flags, _special, _tag, right, left in records("LINEDEFS", "<HHHHHHH"):
-            if right == 0xFFFF or left == 0xFFFF or sides[right][5] != sides[left][5]:
-                continue
-            out.add(tuple(sorted((vertexes[v1], vertexes[v2]))))
-        return out
+        inner, switches = set(), []
+        for v1, v2, _flags, special, _tag, right, left in records("LINEDEFS", "<HHHHHHH"):
+            if right != 0xFFFF and left != 0xFFFF and sides[right][5] == sides[left][5]:
+                inner.add(tuple(sorted((vertexes[v1], vertexes[v2]))))
+            kind = EXIT_SWITCHES.get(special) or EXIT_LINES.get(special) or ("switch" if special in SWITCHES else None)
+            if kind and right != 0xFFFF:
+                (x1, y1), (x2, y2) = vertexes[v1], vertexes[v2]
+                length = math.hypot(x2 - x1, y2 - y1) or 1.0
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                # a line's front is on its right, going from its first vertex to its second
+                switches.append({"kind": kind, "use": special not in EXIT_LINES, "sector": sides[right][5], "x": mx, "y": my,
+                                 "sx": mx + STAND_OFF * (y2 - y1) / length, "sy": my - STAND_OFF * (x2 - x1) / length})
+        return inner, switches
     except Exception:
-        return set()
+        return set(), []
 
 
 class Edge:
