@@ -134,6 +134,7 @@ class NavMap:
         # doors: closed (no headroom) at episode start, few lines, two walkable neighbours
         self.door_like = set()
         self.locked = set()   # doors that would not open when tried; not routed through while they stay shut
+        self.blocked = set()  # cells taken by solid things (barrels, columns, torches), set by block_things
         for i, sec in enumerate(sectors):
             nb = {e.b for e in self.edges.get(i, [])}
             if sec.ceiling_height - sec.floor_height < MIN_GAP and len(nb) >= 2 and len(self.polys[i]) <= 8:
@@ -208,8 +209,19 @@ class NavMap:
         r, c = divmod(idx, self.W)
         return self.x0 + (c + 0.5) * CELL, self.y0 + (r + 0.5) * CELL
 
+    def block_things(self, things):
+        """things: (x, y, radius) of the solid objects now in the map. Their cells stop being walkable."""
+        blocked = set()
+        for x, y, radius in things:
+            reach = radius + PLAYER_RADIUS + 2
+            for r in range(int((y - reach - self.y0) // CELL), int((y + reach - self.y0) // CELL) + 1):
+                for c in range(int((x - reach - self.x0) // CELL), int((x + reach - self.x0) // CELL) + 1):
+                    if 0 <= r < self.H and 0 <= c < self.W and abs(self.x0 + (c + 0.5) * CELL - x) < reach and abs(self.y0 + (r + 0.5) * CELL - y) < reach:
+                        blocked.add(r * self.W + c)
+        self.blocked = blocked
+
     def walkable(self, idx, sectors):
-        if idx is None or self.wall[idx]:
+        if idx is None or self.wall[idx] or idx in self.blocked:
             return False
         s = self.cell_sector[idx]
         if s < 0:

@@ -65,6 +65,11 @@ check(any(o["kind"].startswith("door") and o["sector"] == RECESS_DOOR for o in d
 
 # play it: put the player in the hall, away from the door, and let explore find the exit room
 d.g.send_game_command("god")
+d._tic(d._press(), 1)
+# a monster standing in a doorway blocks the walker and is not on the planner's map (it moves); barrels
+# and columns are on it, and there is a barrel right beside the way out of the last room
+d.g.send_game_command("kill monsters")
+d._tic(d._press(), 1)
 d.g.send_game_command("warp 3008 -3800")
 d._tic(d._press(), 3)
 d.visited = set(range(d.nav.n)) - {LAST_ROOM, 73, 74, 78, 79, 80, 84, EXIT_ROOM, 83}
@@ -79,7 +84,10 @@ check(EXIT_ROOM in d.visited, f"E1M1: explore reaches the exit room ({turn} turn
 obs = d.act([{"goto": [3008, -4700]}], stop_on=[], image="none")
 sw = obs.get("switches") or []
 check(len(sw) == 1 and sw[0]["kind"] == "exit switch" and (sw[0]["x"], sw[0]["y"]) == (2912, -4768), f"E1M1: the exit room lists its exit switch — {sw}")
-obs = d.act([{"turn": sw[0]["bearing"] + 40}, {"use": True}], stop_on=["level"], image="none")
+# from close to the open exit door, which is as much "in reach" as the switch: the one faced wins
+obs = d.act([{"goto": [3008, -4712], "within": 8}], stop_on=[], image="none")
+sw = obs["switches"]
+obs = d.act([{"turn": sw[0]["bearing"] + 30}, {"use": True}], stop_on=["level"], image="none")
 check(obs["finished"], "E1M1: `use`, roughly facing the exit switch, walks up to it and ends the level — " + obs["events"][0])
 d.close()
 print("all good")

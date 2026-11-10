@@ -55,6 +55,18 @@ for name, maps, title in (("doom", [f"E{e}M{m}" for e in range(1, 5) for m in ra
     if p and os.path.exists(p):
         GAMES[name] = {"wad": p, "maps": maps, "title": title}
 
+# Things a player cannot walk through, by engine class name, with their radius. The planner routes
+# around them; without this a barrel beside a doorway wedges the walker against the door frame.
+SOLID_THINGS = {**{n: 10 for n in ("ExplosiveBarrel", "Barrel", "Pod")},
+                **{n: 16 for n in (
+                    "Column", "TechPillar", "TallGreenColumn", "ShortGreenColumn", "TallRedColumn", "ShortRedColumn", "SkullColumn", "HeartColumn",
+                    "EvilEye", "FloatingSkull", "BlueTorch", "GreenTorch", "RedTorch", "ShortBlueTorch", "ShortGreenTorch", "ShortRedTorch",
+                    "Stalagtite", "TechLamp", "TechLamp2", "Candelabra", "BurningBarrel", "HeadsOnAStick", "HeadOnAStick", "HeadCandles",
+                    "DeadStick", "LiveStick", "TorchTree", "BloodyTwitch", "Meat2", "Meat3", "Meat4", "Meat5", "HangNoGuts", "HangBNoBrain",
+                    "HangTLookingDown", "HangTSkull", "HangTLookingUp", "HangTNoBrain",
+                    "SerpentTorch", "FireBrazier", "SmallPillar", "BrownPillar", "StalagmiteSmall", "StalagmiteLarge", "KnightStatue")},
+                "BigTree": 32}
+
 SKILLS = {1: "I'm too young to die", 2: "Hey, not too rough", 3: "Hurt me plenty", 4: "Ultra-Violence", 5: "Nightmare!"}
 
 WEAPON_NAMES = {1: "fist", 2: "pistol", 3: "shotgun", 4: "chaingun", 5: "rocket launcher", 6: "plasma rifle", 7: "BFG9000", 8: "chainsaw"}
@@ -419,6 +431,11 @@ class Doom:
         around = {here} | {e.b for e in self.nav.edges.get(here, []) if e.b in self.nav.sliver}
         return [w for w in self.switches if w["sector"] in around]
 
+    def _block_things(self, s):
+        """Tell the planner where the solid things are now (barrels blow up, so every time a route is planned)."""
+        if self.nav is not None and s is not None:
+            self.nav.block_things([(o.position_x, o.position_y, SOLID_THINGS[o.name]) for o in s.objects if o.name in SOLID_THINGS])
+
     def _mark_visited(self, s=None):
         sec = self._player_sector(s)
         if sec is not None:
@@ -662,6 +679,7 @@ class Doom:
                 return "explore (no map)", None
             px, py = self._pos()
             skip = self.visited | {k for k, v in self.gave_up.items() if v >= 2}
+            self._block_things(s)
             found = self.nav.nearest_unexplored_cell(px, py, s.sectors, skip)
             if not found:
                 events.append("explore: every reachable area has been visited — look for doors that need a key or a switch.")
@@ -752,6 +770,16 @@ class Doom:
         if "use" in action:
             s = self.g.get_state()
             door = self._nearest_door_line(s) if s is not None else None
+            # a switch of this area that is in front and near
+            switch = None
+            if s is not None:
+                for w in self._switches_here(self._player_sector(s)):
+                    b, dist = self._bearing_to(w["x"], w["y"])
+                    if w["use"] and dist <= 256 and abs(b) <= 90 and (switch is None or dist < switch[0]):
+                        switch = (dist, w, abs(b))
+            # a door and a switch both in reach: the one the player is facing more squarely
+            if door is not None and switch is not None and switch[2] < abs(self._bearing_to(door.mx, door.my)[0]):
+                door = None
             if door is not None:
                 # aim square at the door: the nearest point of its line, not its middle seen from the side
                 (x1, y1), (x2, y2) = door.key
@@ -763,13 +791,7 @@ class Doom:
                 if ok:
                     return "use: door opened", None
                 return "use: door did not open", r
-            # no door in reach: a switch of this area that is in front and near? walk up to it and face it
-            switch = None
-            if s is not None:
-                for w in self._switches_here(self._player_sector(s)):
-                    b, dist = self._bearing_to(w["x"], w["y"])
-                    if w["use"] and dist <= 256 and abs(b) <= 90 and (switch is None or dist < switch[0]):
-                        switch = (dist, w)
+            # a switch: walk up to it and face it
             if switch is not None:
                 w = switch[1]
                 _, r, _ = self._walk_to(w["sx"], w["sy"], 12, 35 * 3, stop_on, watch)
@@ -888,6 +910,7 @@ class Doom:
             if s is None:
                 return f"goto {what}", "episode ended"
             px, py = self._pos()
+            self._block_things(s)
             cells = self.nav.path_cells(px, py, tx, ty, s.sectors)
             if cells is None:
                 if replans == 0:
@@ -970,6 +993,8 @@ class Doom:
         pa = float(self.g.get_game_variable(vzd.GameVariable.ANGLE))
         best = None
         for e in self.nav.door_edges(here):
+            if not self.nav.closed(e.b, s.sectors):
+                continue   # already open: pressing use on it would shut it
             d = math.hypot(e.mx - px, e.my - py)
             rel = abs(ang_norm(math.degrees(math.atan2(e.my - py, e.mx - px)) - pa))
             if d <= max_dist and rel <= max_bearing and (best is None or d < best[0]):
